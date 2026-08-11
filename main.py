@@ -1,10 +1,12 @@
 import os
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("ODDSAPI_KEY")
+API_KEY = os.environ.get("ODDSPAPI_KEY")
+
+BASE_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
 
 
 @app.route("/")
@@ -15,112 +17,99 @@ def home():
     })
 
 
-@app.route("/scan")
-def scan():
+def get_odds():
     if not API_KEY:
-        return jsonify({
-            "error": "ODDSAPI_KEY no configurada"
-        }), 500
+        return None, "ODDSPAPI_KEY no configurada"
 
-    url = "https://api.odds-api.io/v3/odds"
+    tournament_id = request.args.get("tournamentId", "7")
 
     params = {
-        "apiKey": API_KEY,
-        "bookmakers": "Winamax"
+        "tournamentIds": tournament_id,
+        "bookmakers": "winamax.es",
+        "language": "es",
+        "verbosity": 3,
+        "apiKey": API_KEY
     }
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(BASE_URL, params=params, timeout=30)
         response.raise_for_status()
-        return jsonify(response.json())
+        return response.json(), None
 
-    except requests.RequestException as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+    except Exception as e:
+        return None, str(e)
+
+
+@app.route("/scan")
+def scan():
+    data, error = get_odds()
+
+    if error:
+        return jsonify({"error": error}), 500
+
+    return jsonify(data)
 
 
 @app.route("/debug")
 def debug():
-    if not API_KEY:
-        return jsonify({
-            "error": "ODDSAPI_KEY no configurada"
-        }), 500
+    data, error = get_odds()
 
-    url = "https://api.odds-api.io/v3/odds"
+    if error:
+        return jsonify({"error": error}), 500
 
-    params = {
-        "apiKey": API_KEY,
-        "bookmakers": "Winamax"
-    }
+    fixtures = data if isinstance(data, list) else [data]
 
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    diagnostic = []
 
-        diagnostic = []
+    for fixture_index, fixture in enumerate(fixtures):
 
-        # Recorremos los partidos recibidos
-        fixtures = data if isinstance(data, list) else [data]
+        bookmaker_odds = fixture.get("bookmakerOdds", {})
+        winamax = bookmaker_odds.get("winamax.es", {})
+        markets = winamax.get("markets", {})
 
-        for fixture_index, fixture in enumerate(fixtures):
+        fixture_result = {
+            "fixture_index": fixture_index,
+            "fixtureId": fixture.get("fixtureId"),
+            "participant1Name": fixture.get("participant1Name"),
+            "participant2Name": fixture.get("participant2Name"),
+            "bookmakerFixtureId": winamax.get("bookmakerFixtureId"),
+            "markets": []
+        }
 
-            bookmaker_odds = fixture.get("bookmakerOdds", {})
-            winamax = bookmaker_odds.get("winamax.es", {})
-            markets = winamax.get("markets", {})
+        for market_id, market in markets.items():
 
-            fixture_result = {
-                "fixture_index": fixture_index,
-                "bookmakerFixtureId": winamax.get("bookmakerFixtureId"),
-                "markets": []
+            market_result = {
+                "market_id": market_id,
+                "marketActive": market.get("marketActive"),
+                "outcomes": []
             }
 
-            for market_id, market in markets.items():
+            outcomes = market.get("outcomes", {})
 
-                market_result = {
-                    "market_id": market_id,
-                    "marketActive": market.get("marketActive"),
-                    "outcomes": []
-                }
+            for outcome_id, outcome in outcomes.items():
 
-                outcomes = market.get("outcomes", {})
+                players = outcome.get("players", {})
 
-                for outcome_id, outcome in outcomes.items():
+                for player_id, player in players.items():
 
-                    players = outcome.get("players", {})
+                    market_result["outcomes"].append({
+                        "outcome_id": outcome_id,
+                        "player_id": player_id,
+                        "active": player.get("active"),
+                        "mainLine": player.get("mainLine"),
+                        "playerName": player.get("playerName"),
+                        "price": player.get("price"),
+                        "changedAt": player.get("changedAt")
+                    })
 
-                    for player_id, player in players.items():
+            fixture_result["markets"].append(market_result)
 
-                        market_result["outcomes"].append({
-                            "outcome_id": outcome_id,
-                            "player_id": player_id,
-                            "active": player.get("active"),
-                            "mainLine": player.get("mainLine"),
-                            "playerName": player.get("playerName"),
-                            "price": player.get("price"),
-                            "changedAt": player.get("changedAt")
-                        })
+        diagnostic.append(fixture_result)
 
-                fixture_result["markets"].append(market_result)
-
-            diagnostic.append(fixture_result)
-
-        return jsonify({
-            "status": "ok",
-            "fixtures": diagnostic
-        })
-
-    except requests.RequestException as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-    except Exception as e:
-        return jsonify({
-            "error": "Error procesando datos",
-            "detail": str(e)
-        }), 500
+    return jsonify({
+        "status": "ok",
+        "fixtures": diagnostic
+    })
 
 
 if __name__ == "__main__":
