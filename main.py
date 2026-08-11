@@ -11,11 +11,69 @@ MARKETS_URL = "https://api.oddspapi.io/v4/markets"
 
 
 # =========================================================
-# LLAMADA GENERAL A ODDSPAPI
+# CONFIGURACIÓN DE MERCADOS
+# =========================================================
+
+MARKETS = {
+    "1X2": {
+        "market_id": "101",
+        "outcomes": {
+            "Local": "101",
+            "Empate": "102",
+            "Visitante": "103"
+        }
+    },
+
+    "Ambos marcan": {
+        "market_id": "104",
+        "outcomes": {
+            "Si": "104",
+            "No": "105"
+        }
+    },
+
+    "Over Under 1.5": {
+        "market_id": "108",
+        "outcomes": {
+            "Over 1.5": "108",
+            "Under 1.5": "109"
+        }
+    },
+
+    "Over Under 2.5": {
+        "market_id": "1010",
+        "outcomes": {
+            "Over 2.5": "1010",
+            "Under 2.5": "1011"
+        }
+    },
+
+    "Over Under 3.5": {
+        "market_id": "1012",
+        "outcomes": {
+            "Over 3.5": "1012",
+            "Under 3.5": "1013"
+        }
+    },
+
+    "Over Under 4.5": {
+        "market_id": "1014",
+        "outcomes": {
+            "Over 4.5": "1014",
+            "Under 4.5": "1015"
+        }
+    }
+}
+
+
+# =========================================================
+# LLAMADA API
 # =========================================================
 
 def api_get(url, params):
+
     try:
+
         response = requests.get(
             url,
             params=params,
@@ -28,12 +86,10 @@ def api_get(url, params):
 
     except requests.exceptions.RequestException as e:
 
-        detalle = ""
-
         try:
             detalle = response.text[:1000]
         except Exception:
-            pass
+            detalle = ""
 
         return None, {
             "mensaje": str(e),
@@ -49,12 +105,13 @@ def api_get(url, params):
 
 
 # =========================================================
-# OBTENER CUOTAS DE WINAMAX
+# OBTENER CUOTAS
 # =========================================================
 
-def get_odds():
+def get_odds(bookmakers="winamax.es"):
 
     if not API_KEY:
+
         return None, {
             "mensaje": "ODDSPAPI_KEY no configurada"
         }
@@ -66,9 +123,10 @@ def get_odds():
 
     params = {
         "tournamentIds": tournament_id,
-        "bookmakers": "winamax.es",
+        "bookmakers": bookmakers,
         "language": "es",
         "verbosity": 3,
+        "oddsFormat": "decimal",
         "apiKey": API_KEY
     }
 
@@ -98,7 +156,7 @@ def normalize_fixtures(data):
 
 
 # =========================================================
-# OBTENER PRECIO
+# OBTENER PRECIO DE UNA SELECCIÓN
 # =========================================================
 
 def get_price(markets, market_id, outcome_id):
@@ -108,7 +166,13 @@ def get_price(markets, market_id, outcome_id):
         {}
     )
 
-    if not market.get("marketActive", True):
+    if not market:
+        return None
+
+    if not market.get(
+        "marketActive",
+        True
+    ):
         return None
 
     outcome = market.get(
@@ -136,10 +200,102 @@ def get_price(markets, market_id, outcome_id):
                 return float(
                     player.get("price")
                 )
+
             except Exception:
-                return player.get("price")
+                return None
 
     return None
+
+
+# =========================================================
+# EXTRAER UN MERCADO COMPLETO
+# =========================================================
+
+def extract_market(markets, config):
+
+    prices = {}
+
+    market_id = config["market_id"]
+
+    for name, outcome_id in config["outcomes"].items():
+
+        price = get_price(
+            markets,
+            market_id,
+            outcome_id
+        )
+
+        if price is None:
+            return None
+
+        prices[name] = price
+
+    return prices
+
+
+# =========================================================
+# QUITAR MARGEN DE PINNACLE
+# =========================================================
+
+def remove_vig(prices):
+
+    if not prices:
+        return None
+
+    implied = {}
+
+    total = 0
+
+    for selection, price in prices.items():
+
+        if not price or price <= 1:
+            return None
+
+        probability = 1 / price
+
+        implied[selection] = probability
+
+        total += probability
+
+    if total <= 0:
+        return None
+
+    fair = {}
+
+    for selection, probability in implied.items():
+
+        fair_probability = probability / total
+
+        fair[selection] = {
+            "probabilidad_justa":
+                fair_probability,
+
+            "cuota_justa":
+                1 / fair_probability
+        }
+
+    return fair
+
+
+# =========================================================
+# VALUE SCORE
+# =========================================================
+
+def value_score(edge):
+
+    if edge >= 10:
+        return "A+"
+
+    if edge >= 8:
+        return "A"
+
+    if edge >= 5:
+        return "B"
+
+    if edge >= 3:
+        return "C"
+
+    return "PASS"
 
 
 # =========================================================
@@ -151,24 +307,26 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "message": "Winamax Odds API funcionando",
+        "message": "Winamax Value Scanner",
         "rutas": {
-            "scan": "/scan",
             "simple": "/simple",
-            "debug": "/debug",
+            "value": "/value",
+            "scan": "/scan",
             "markets": "/markets"
         }
     })
 
 
 # =========================================================
-# SCAN - JSON ORIGINAL
+# SCAN RAW
 # =========================================================
 
 @app.route("/scan")
 def scan():
 
-    data, error = get_odds()
+    data, error = get_odds(
+        "winamax.es"
+    )
 
     if error:
 
@@ -180,7 +338,7 @@ def scan():
 
 
 # =========================================================
-# CATÁLOGO DE MERCADOS
+# MARKETS
 # =========================================================
 
 @app.route("/markets")
@@ -211,13 +369,14 @@ def markets_catalog():
 
 # =========================================================
 # SIMPLE
-# MERCADOS PRINCIPALES DE WINAMAX
 # =========================================================
 
 @app.route("/simple")
 def simple():
 
-    data, error = get_odds()
+    data, error = get_odds(
+        "winamax.es"
+    )
 
     if error:
 
@@ -225,18 +384,18 @@ def simple():
             "error": error
         }), 500
 
-    fixtures = normalize_fixtures(data)
+    fixtures = normalize_fixtures(
+        data
+    )
 
     results = []
 
     for fixture in fixtures:
 
-        bookmaker_odds = fixture.get(
+        winamax = fixture.get(
             "bookmakerOdds",
             {}
-        )
-
-        winamax = bookmaker_odds.get(
+        ).get(
             "winamax.es",
             {}
         )
@@ -247,123 +406,22 @@ def simple():
         )
 
         partido = {
-
             "partido": (
                 f"{fixture.get('participant1Name', 'Local')} - "
                 f"{fixture.get('participant2Name', 'Visitante')}"
-            ),
-
-            "1X2": {
-
-                "Local":
-                    get_price(
-                        markets,
-                        101,
-                        101
-                    ),
-
-                "Empate":
-                    get_price(
-                        markets,
-                        101,
-                        102
-                    ),
-
-                "Visitante":
-                    get_price(
-                        markets,
-                        101,
-                        103
-                    )
-            },
-
-            "Ambos marcan": {
-
-                "Si":
-                    get_price(
-                        markets,
-                        104,
-                        104
-                    ),
-
-                "No":
-                    get_price(
-                        markets,
-                        104,
-                        105
-                    )
-            },
-
-            "Over Under 1.5": {
-
-                "Over 1.5":
-                    get_price(
-                        markets,
-                        108,
-                        108
-                    ),
-
-                "Under 1.5":
-                    get_price(
-                        markets,
-                        108,
-                        109
-                    )
-            },
-
-            "Over Under 2.5": {
-
-                "Over 2.5":
-                    get_price(
-                        markets,
-                        1010,
-                        1010
-                    ),
-
-                "Under 2.5":
-                    get_price(
-                        markets,
-                        1010,
-                        1011
-                    )
-            },
-
-            "Over Under 3.5": {
-
-                "Over 3.5":
-                    get_price(
-                        markets,
-                        1012,
-                        1012
-                    ),
-
-                "Under 3.5":
-                    get_price(
-                        markets,
-                        1012,
-                        1013
-                    )
-            },
-
-            "Over Under 4.5": {
-
-                "Over 4.5":
-                    get_price(
-                        markets,
-                        1014,
-                        1014
-                    ),
-
-                "Under 4.5":
-                    get_price(
-                        markets,
-                        1014,
-                        1015
-                    )
-            }
+            )
         }
 
-        results.append(partido)
+        for market_name, config in MARKETS.items():
+
+            partido[market_name] = extract_market(
+                markets,
+                config
+            )
+
+        results.append(
+            partido
+        )
 
     return jsonify({
         "status": "ok",
@@ -374,13 +432,15 @@ def simple():
 
 
 # =========================================================
-# DEBUG
+# VALUE SCANNER
 # =========================================================
 
-@app.route("/debug")
-def debug():
+@app.route("/value")
+def value():
 
-    data, error = get_odds()
+    data, error = get_odds(
+        "winamax.es,pinnacle"
+    )
 
     if error:
 
@@ -388,12 +448,187 @@ def debug():
             "error": error
         }), 500
 
-    fixtures = normalize_fixtures(data)
+    fixtures = normalize_fixtures(
+        data
+    )
+
+    oportunidades = []
+
+    partidos_analizados = 0
+
+    for fixture in fixtures:
+
+        bookmaker_odds = fixture.get(
+            "bookmakerOdds",
+            {}
+        )
+
+        winamax_data = bookmaker_odds.get(
+            "winamax.es",
+            {}
+        )
+
+        pinnacle_data = bookmaker_odds.get(
+            "pinnacle",
+            {}
+        )
+
+        if not winamax_data or not pinnacle_data:
+            continue
+
+        winamax_markets = winamax_data.get(
+            "markets",
+            {}
+        )
+
+        pinnacle_markets = pinnacle_data.get(
+            "markets",
+            {}
+        )
+
+        partidos_analizados += 1
+
+        partido_name = (
+            f"{fixture.get('participant1Name', 'Local')} - "
+            f"{fixture.get('participant2Name', 'Visitante')}"
+        )
+
+        for market_name, config in MARKETS.items():
+
+            winamax_prices = extract_market(
+                winamax_markets,
+                config
+            )
+
+            pinnacle_prices = extract_market(
+                pinnacle_markets,
+                config
+            )
+
+            if (
+                not winamax_prices
+                or
+                not pinnacle_prices
+            ):
+                continue
+
+            fair = remove_vig(
+                pinnacle_prices
+            )
+
+            if not fair:
+                continue
+
+            for selection, winamax_price in winamax_prices.items():
+
+                if selection not in fair:
+                    continue
+
+                probability = fair[
+                    selection
+                ][
+                    "probabilidad_justa"
+                ]
+
+                fair_odds = fair[
+                    selection
+                ][
+                    "cuota_justa"
+                ]
+
+                edge = (
+                    (
+                        winamax_price
+                        * probability
+                    )
+                    - 1
+                ) * 100
+
+                score = value_score(
+                    edge
+                )
+
+                if edge >= 3:
+
+                    oportunidades.append({
+
+                        "partido":
+                            partido_name,
+
+                        "mercado":
+                            market_name,
+
+                        "seleccion":
+                            selection,
+
+                        "cuota_winamax":
+                            round(
+                                winamax_price,
+                                3
+                            ),
+
+                        "cuota_pinnacle":
+                            round(
+                                pinnacle_prices[
+                                    selection
+                                ],
+                                3
+                            ),
+
+                        "probabilidad_justa_pct":
+                            round(
+                                probability * 100,
+                                2
+                            ),
+
+                        "cuota_justa":
+                            round(
+                                fair_odds,
+                                3
+                            ),
+
+                        "edge_pct":
+                            round(
+                                edge,
+                                2
+                            ),
+
+                        "value_score":
+                            score,
+
+                        "decision":
+                            (
+                                "APTO"
+                                if edge >= 5
+                                else
+                                "REVISAR"
+                            )
+                    })
+
+    oportunidades.sort(
+        key=lambda x: x["edge_pct"],
+        reverse=True
+    )
 
     return jsonify({
-        "status": "ok",
-        "numero_partidos": len(fixtures),
-        "fixtures": fixtures
+
+        "status":
+            "ok",
+
+        "referencia":
+            "Pinnacle sin margen",
+
+        "partidos_analizados":
+            partidos_analizados,
+
+        "numero_oportunidades":
+            len(oportunidades),
+
+        "filtro_minimo_edge_pct":
+            3,
+
+        "oportunidades":
+            oportunidades
     })
 
 
