@@ -4,23 +4,69 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("ODDSPAPI_KEY")
-BASE_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+
+API_KEY = os.environ.get("ODDSPAPI_KEY", "").strip()
+
+ODDS_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
+MARKETS_URL = "https://api.oddspapi.io/v4/markets"
 
 
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "ok",
-        "message": "Winamax Odds API funcionando"
-    })
+# =========================================================
+# FUNCIÓN GENERAL PARA LLAMAR A ODDSPAPI
+# =========================================================
 
+def api_get(url, params):
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json(), None
+
+    except requests.exceptions.RequestException as e:
+
+        detalle = ""
+
+        try:
+            detalle = response.text[:1000]
+        except Exception:
+            pass
+
+        return None, {
+            "mensaje": str(e),
+            "respuesta_api": detalle
+        }
+
+    except ValueError as e:
+
+        return None, {
+            "mensaje": "OddsPapi no devolvió JSON válido",
+            "detalle": str(e)
+        }
+
+
+# =========================================================
+# OBTENER CUOTAS WINAMAX
+# =========================================================
 
 def get_odds():
-    if not API_KEY:
-        return None, "ODDSPAPI_KEY no configurada"
 
-    tournament_id = request.args.get("tournamentId", "7")
+    if not API_KEY:
+        return None, {
+            "mensaje": "ODDSPAPI_KEY no configurada"
+        }
+
+    tournament_id = request.args.get(
+        "tournamentId",
+        "7"
+    )
 
     params = {
         "tournamentIds": tournament_id,
@@ -30,93 +76,209 @@ def get_odds():
         "apiKey": API_KEY
     }
 
-    try:
-        response = requests.get(BASE_URL, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json(), None
+    return api_get(
+        ODDS_URL,
+        params
+    )
 
-    except Exception as e:
-        return None, str(e)
 
+# =========================================================
+# NORMALIZAR PARTIDOS
+# =========================================================
 
 def normalize_fixtures(data):
+
     if isinstance(data, list):
         return data
 
     if isinstance(data, dict):
-        if isinstance(data.get("fixtures"), list):
+
+        if isinstance(
+            data.get("fixtures"),
+            list
+        ):
             return data["fixtures"]
+
         return [data]
 
     return []
 
 
-def get_price(markets, market_id, outcome_id):
-    market = markets.get(str(market_id), {})
-    outcome = market.get("outcomes", {}).get(str(outcome_id), {})
-    players = outcome.get("players", {})
+# =========================================================
+# HOME
+# =========================================================
 
-    for player in players.values():
-        if player.get("active") and player.get("price") is not None:
-            return player.get("price")
+@app.route("/")
+def home():
 
-    return None
+    return jsonify({
+        "status": "ok",
+        "message": "Winamax Odds API funcionando",
+        "rutas": {
+            "scan": "/scan",
+            "debug": "/debug",
+            "markets": "/markets",
+            "simple": "/simple"
+        }
+    })
 
+
+# =========================================================
+# SCAN
+# DEVUELVE LOS DATOS CRUDOS DE WINAMAX
+# =========================================================
 
 @app.route("/scan")
 def scan():
+
     data, error = get_odds()
 
     if error:
-        return jsonify({"error": error}), 500
+        return jsonify({
+            "error": error
+        }), 500
 
     return jsonify(data)
 
 
+# =========================================================
+# DEBUG
+# ORDENA LOS MERCADOS SIN INTERPRETARLOS
+# =========================================================
+
 @app.route("/debug")
 def debug():
+
     data, error = get_odds()
 
     if error:
-        return jsonify({"error": error}), 500
+        return jsonify({
+            "error": error
+        }), 500
 
     fixtures = normalize_fixtures(data)
+
     diagnostic = []
 
     for fixture_index, fixture in enumerate(fixtures):
-        bookmaker_odds = fixture.get("bookmakerOdds", {})
-        winamax = bookmaker_odds.get("winamax.es", {})
-        markets = winamax.get("markets", {})
+
+        bookmaker_odds = fixture.get(
+            "bookmakerOdds",
+            {}
+        )
+
+        winamax = bookmaker_odds.get(
+            "winamax.es",
+            {}
+        )
+
+        markets = winamax.get(
+            "markets",
+            {}
+        )
 
         fixture_result = {
-            "fixture_index": fixture_index,
-            "fixtureId": fixture.get("fixtureId"),
-            "participant1Name": fixture.get("participant1Name"),
-            "participant2Name": fixture.get("participant2Name"),
-            "bookmakerFixtureId": winamax.get("bookmakerFixtureId"),
+
+            "fixture_index":
+                fixture_index,
+
+            "fixtureId":
+                fixture.get(
+                    "fixtureId"
+                ),
+
+            "participant1Name":
+                fixture.get(
+                    "participant1Name"
+                ),
+
+            "participant2Name":
+                fixture.get(
+                    "participant2Name"
+                ),
+
+            "bookmakerFixtureId":
+                winamax.get(
+                    "bookmakerFixtureId"
+                ),
+
             "markets": []
         }
 
         for market_id, market in markets.items():
+
             market_result = {
-                "market_id": market_id,
-                "marketActive": market.get("marketActive"),
+
+                "market_id":
+                    market_id,
+
+                "marketActive":
+                    market.get(
+                        "marketActive"
+                    ),
+
                 "outcomes": []
             }
 
-            for outcome_id, outcome in market.get("outcomes", {}).items():
-                for player_id, player in outcome.get("players", {}).items():
-                    market_result["outcomes"].append({
-                        "outcome_id": outcome_id,
-                        "player_id": player_id,
-                        "active": player.get("active"),
-                        "mainLine": player.get("mainLine"),
-                        "price": player.get("price")
+            outcomes = market.get(
+                "outcomes",
+                {}
+            )
+
+            for outcome_id, outcome in outcomes.items():
+
+                players = outcome.get(
+                    "players",
+                    {}
+                )
+
+                for player_id, player in players.items():
+
+                    market_result[
+                        "outcomes"
+                    ].append({
+
+                        "outcome_id":
+                            outcome_id,
+
+                        "player_id":
+                            player_id,
+
+                        "active":
+                            player.get(
+                                "active"
+                            ),
+
+                        "mainLine":
+                            player.get(
+                                "mainLine"
+                            ),
+
+                        "playerName":
+                            player.get(
+                                "playerName"
+                            ),
+
+                        "price":
+                            player.get(
+                                "price"
+                            ),
+
+                        "changedAt":
+                            player.get(
+                                "changedAt"
+                            )
                     })
 
-            fixture_result["markets"].append(market_result)
+            fixture_result[
+                "markets"
+            ].append(
+                market_result
+            )
 
-        diagnostic.append(fixture_result)
+        diagnostic.append(
+            fixture_result
+        )
 
     return jsonify({
         "status": "ok",
@@ -124,55 +286,165 @@ def debug():
     })
 
 
+# =========================================================
+# CATÁLOGO OFICIAL DE MERCADOS ODDSPAPI
+# ESTA ES LA RUTA QUE QUEREMOS PROBAR AHORA
+# =========================================================
+
+@app.route("/markets")
+def markets_catalog():
+
+    if not API_KEY:
+
+        return jsonify({
+            "error": "ODDSPAPI_KEY no configurada"
+        }), 500
+
+    params = {
+        "language": "es",
+        "apiKey": API_KEY
+    }
+
+    data, error = api_get(
+        MARKETS_URL,
+        params
+    )
+
+    if error:
+
+        return jsonify({
+            "error": error
+        }), 500
+
+    return jsonify(data)
+
+
+# =========================================================
+# SIMPLE
+#
+# DE MOMENTO NO TRADUCIMOS LOS IDS.
+#
+# PRIMERO VAMOS A IDENTIFICAR CORRECTAMENTE:
+# 1X2
+# AMBOS MARCAN
+# OVER/UNDER 1.5
+# OVER/UNDER 2.5
+# OVER/UNDER 3.5
+#
+# UTILIZANDO /markets
+# =========================================================
+
 @app.route("/simple")
 def simple():
+
     data, error = get_odds()
 
     if error:
-        return jsonify({"error": error}), 500
 
-    fixtures = normalize_fixtures(data)
+        return jsonify({
+            "error": error
+        }), 500
+
+    fixtures = normalize_fixtures(
+        data
+    )
+
     results = []
 
     for fixture in fixtures:
-        bookmaker_odds = fixture.get("bookmakerOdds", {})
-        winamax = bookmaker_odds.get("winamax.es", {})
-        markets = winamax.get("markets", {})
+
+        bookmaker_odds = fixture.get(
+            "bookmakerOdds",
+            {}
+        )
+
+        winamax = bookmaker_odds.get(
+            "winamax.es",
+            {}
+        )
+
+        markets = winamax.get(
+            "markets",
+            {}
+        )
 
         partido = {
-            "partido": (
-                f"{fixture.get('participant1Name', 'Local')} - "
-                f"{fixture.get('participant2Name', 'Visitante')}"
-            ),
 
-            "1X2": {
-                "Local": get_price(markets, "101", "101"),
-                "Empate": get_price(markets, "101", "102"),
-                "Visitante": get_price(markets, "101", "103")
-            },
+            "partido":
+                (
+                    f"{fixture.get('participant1Name', 'Local')}"
+                    " - "
+                    f"{fixture.get('participant2Name', 'Visitante')}"
+                ),
 
-            "Ambos marcan": {
-                "Si": get_price(markets, "104", "104"),
-                "No": get_price(markets, "104", "105")
-            },
+            "fixtureId":
+                fixture.get(
+                    "fixtureId"
+                ),
 
-            "Over Under 1.5": {
-                "Over 1.5": get_price(markets, "1012", "1012"),
-                "Under 1.5": get_price(markets, "1012", "1013")
-            },
+            "numero_mercados":
+                len(markets),
 
-            "Over Under 2.5": {
-                "Over 2.5": get_price(markets, "1010", "1010"),
-                "Under 2.5": get_price(markets, "1010", "1011")
-            },
-
-            "Over Under 3.5": {
-                "Over 3.5": get_price(markets, "1014", "1014"),
-                "Under 3.5": get_price(markets, "1014", "1015")
-            }
+            "mercados":
+                []
         }
 
-        results.append(partido)
+        for market_id, market in markets.items():
+
+            market_data = {
+
+                "market_id":
+                    market_id,
+
+                "outcomes":
+                    []
+            }
+
+            outcomes = market.get(
+                "outcomes",
+                {}
+            )
+
+            for outcome_id, outcome in outcomes.items():
+
+                for player_id, player in outcome.get(
+                    "players",
+                    {}
+                ).items():
+
+                    if (
+                        player.get("active")
+                        and
+                        player.get("price") is not None
+                    ):
+
+                        market_data[
+                            "outcomes"
+                        ].append({
+
+                            "outcome_id":
+                                outcome_id,
+
+                            "price":
+                                player.get(
+                                    "price"
+                                ),
+
+                            "mainLine":
+                                player.get(
+                                    "mainLine"
+                                )
+                        })
+
+            partido[
+                "mercados"
+            ].append(
+                market_data
+            )
+
+        results.append(
+            partido
+        )
 
     return jsonify({
         "status": "ok",
@@ -181,49 +453,20 @@ def simple():
     })
 
 
+# =========================================================
+# ARRANCAR SERVIDOR
+# =========================================================
+
 if __name__ == "__main__":
-    @app.route("/markets")
-def markets_catalog():
-    if not API_KEY:
-        return jsonify({"error": "ODDSPAPI_KEY no configurada"}), 500
 
-    try:
-        response = requests.get(
-            "https://api.oddspapi.io/v4/markets",
-            params={
-                "language": "es",
-                "apiKey": API_KEY
-            },
-            timeout=30
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
         )
+    )
 
-        response.raise_for_status()
-        data = response.json()
-
-        seleccionados = []
-
-        for market in data:
-            if market.get("sportId") != 10:
-                continue
-
-            # 1X2 y Ambos Marcan
-            if market.get("marketId") in [101, 104]:
-                seleccionados.append(market)
-                continue
-
-            # Totales de goles FT: 1.5, 2.5 y 3.5
-            if (
-                market.get("period") == "fulltime"
-                and market.get("marketType") == "totals"
-                and market.get("playerProp") is False
-                and market.get("handicap") in [1.5, 2.5, 3.5]
-            ):
-                seleccionados.append(market)
-
-        return jsonify({
-            "status": "ok",
-            "markets": seleccionados
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
