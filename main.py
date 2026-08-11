@@ -182,5 +182,48 @@ def simple():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    @app.route("/markets")
+def markets_catalog():
+    if not API_KEY:
+        return jsonify({"error": "ODDSPAPI_KEY no configurada"}), 500
+
+    try:
+        response = requests.get(
+            "https://api.oddspapi.io/v4/markets",
+            params={
+                "language": "es",
+                "apiKey": API_KEY
+            },
+            timeout=30
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        seleccionados = []
+
+        for market in data:
+            if market.get("sportId") != 10:
+                continue
+
+            # 1X2 y Ambos Marcan
+            if market.get("marketId") in [101, 104]:
+                seleccionados.append(market)
+                continue
+
+            # Totales de goles FT: 1.5, 2.5 y 3.5
+            if (
+                market.get("period") == "fulltime"
+                and market.get("marketType") == "totals"
+                and market.get("playerProp") is False
+                and market.get("handicap") in [1.5, 2.5, 3.5]
+            ):
+                seleccionados.append(market)
+
+        return jsonify({
+            "status": "ok",
+            "markets": seleccionados
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
