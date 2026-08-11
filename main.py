@@ -5,7 +5,6 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 API_KEY = os.environ.get("ODDSPAPI_KEY")
-
 BASE_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
 
 
@@ -40,6 +39,30 @@ def get_odds():
         return None, str(e)
 
 
+def normalize_fixtures(data):
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        if isinstance(data.get("fixtures"), list):
+            return data["fixtures"]
+        return [data]
+
+    return []
+
+
+def get_price(markets, market_id, outcome_id):
+    market = markets.get(str(market_id), {})
+    outcome = market.get("outcomes", {}).get(str(outcome_id), {})
+    players = outcome.get("players", {})
+
+    for player in players.values():
+        if player.get("active") and player.get("price") is not None:
+            return player.get("price")
+
+    return None
+
+
 @app.route("/scan")
 def scan():
     data, error = get_odds()
@@ -57,12 +80,10 @@ def debug():
     if error:
         return jsonify({"error": error}), 500
 
-    fixtures = data if isinstance(data, list) else [data]
-
+    fixtures = normalize_fixtures(data)
     diagnostic = []
 
     for fixture_index, fixture in enumerate(fixtures):
-
         bookmaker_odds = fixture.get("bookmakerOdds", {})
         winamax = bookmaker_odds.get("winamax.es", {})
         markets = winamax.get("markets", {})
@@ -77,29 +98,20 @@ def debug():
         }
 
         for market_id, market in markets.items():
-
             market_result = {
                 "market_id": market_id,
                 "marketActive": market.get("marketActive"),
                 "outcomes": []
             }
 
-            outcomes = market.get("outcomes", {})
-
-            for outcome_id, outcome in outcomes.items():
-
-                players = outcome.get("players", {})
-
-                for player_id, player in players.items():
-
+            for outcome_id, outcome in market.get("outcomes", {}).items():
+                for player_id, player in outcome.get("players", {}).items():
                     market_result["outcomes"].append({
                         "outcome_id": outcome_id,
                         "player_id": player_id,
                         "active": player.get("active"),
                         "mainLine": player.get("mainLine"),
-                        "playerName": player.get("playerName"),
-                        "price": player.get("price"),
-                        "changedAt": player.get("changedAt")
+                        "price": player.get("price")
                     })
 
             fixture_result["markets"].append(market_result)
@@ -109,6 +121,63 @@ def debug():
     return jsonify({
         "status": "ok",
         "fixtures": diagnostic
+    })
+
+
+@app.route("/simple")
+def simple():
+    data, error = get_odds()
+
+    if error:
+        return jsonify({"error": error}), 500
+
+    fixtures = normalize_fixtures(data)
+    results = []
+
+    for fixture in fixtures:
+        bookmaker_odds = fixture.get("bookmakerOdds", {})
+        winamax = bookmaker_odds.get("winamax.es", {})
+        markets = winamax.get("markets", {})
+
+        partido = {
+            "partido": (
+                f"{fixture.get('participant1Name', 'Local')} - "
+                f"{fixture.get('participant2Name', 'Visitante')}"
+            ),
+
+            "1X2": {
+                "Local": get_price(markets, "101", "101"),
+                "Empate": get_price(markets, "101", "102"),
+                "Visitante": get_price(markets, "101", "103")
+            },
+
+            "Ambos marcan": {
+                "Si": get_price(markets, "104", "104"),
+                "No": get_price(markets, "104", "105")
+            },
+
+            "Over Under 1.5": {
+                "Over 1.5": get_price(markets, "1012", "1012"),
+                "Under 1.5": get_price(markets, "1012", "1013")
+            },
+
+            "Over Under 2.5": {
+                "Over 2.5": get_price(markets, "1010", "1010"),
+                "Under 2.5": get_price(markets, "1010", "1011")
+            },
+
+            "Over Under 3.5": {
+                "Over 3.5": get_price(markets, "1014", "1014"),
+                "Under 3.5": get_price(markets, "1014", "1015")
+            }
+        }
+
+        results.append(partido)
+
+    return jsonify({
+        "status": "ok",
+        "bookmaker": "winamax.es",
+        "partidos": results
     })
 
 
