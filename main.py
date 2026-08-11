@@ -1,16 +1,36 @@
 import os
+import statistics
 import requests
+
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request
+
 
 app = Flask(__name__)
 
+
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+
 API_KEY = os.environ.get("ODDSPAPI_KEY", "").strip()
 
-ODDS_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
+BASE_URL = "https://api.oddspapi.io/v4"
+
+ODDS_URL = f"{BASE_URL}/odds-by-tournaments"
+ACCOUNT_URL = f"{BASE_URL}/account"
+
+TARGET_BOOKMAKER = "winamax.es"
+
+REFERENCE_BOOKMAKERS = [
+    "pinnacle",
+    "singbet",
+    "sbobet"
+]
 
 
 # =========================================================
-# MERCADOS QUE VAMOS A ANALIZAR
+# MERCADOS
 # =========================================================
 
 MARKETS = {
@@ -67,15 +87,35 @@ MARKETS = {
 
 
 # =========================================================
-# LLAMADA A ODDSPAPI
+# SEGURIDAD: NO MOSTRAR API KEY EN ERRORES
 # =========================================================
 
-def api_get(params):
+def sanitize_text(text):
+
+    if not text:
+        return ""
+
+    text = str(text)
+
+    if API_KEY:
+        text = text.replace(
+            API_KEY,
+            "***OCULTA***"
+        )
+
+    return text
+
+
+# =========================================================
+# LLAMADA API
+# =========================================================
+
+def api_request(url, params):
 
     try:
 
         response = requests.get(
-            ODDS_URL,
+            url,
             params=params,
             timeout=30
         )
@@ -92,21 +132,20 @@ def api_get(params):
             detalle = ""
 
         return None, {
-            "mensaje": str(e),
-            "respuesta_api": detalle
+            "mensaje": sanitize_text(str(e)),
+            "respuesta_api": sanitize_text(detalle)
         }
 
     except ValueError as e:
 
         return None, {
-            "mensaje": "OddsPapi no devolvió JSON válido",
-            "detalle": str(e)
+            "mensaje": "Respuesta JSON no válida",
+            "detalle": sanitize_text(str(e))
         }
 
 
 # =========================================================
-# OBTENER UNA CASA
-# IMPORTANTE: UNA CASA POR PETICIÓN
+# OBTENER CUOTAS DE UNA CASA
 # =========================================================
 
 def get_bookmaker_odds(bookmaker):
@@ -124,17 +163,17 @@ def get_bookmaker_odds(bookmaker):
 
     params = {
         "tournamentIds": tournament_id,
-
-        # Singular: una casa por petición
         "bookmaker": bookmaker,
-
         "language": "es",
         "verbosity": 3,
         "oddsFormat": "decimal",
         "apiKey": API_KEY
     }
 
-    return api_get(params)
+    return api_request(
+        ODDS_URL,
+        params
+    )
 
 
 # =========================================================
@@ -148,7 +187,10 @@ def normalize_fixtures(data):
 
     if isinstance(data, dict):
 
-        if isinstance(data.get("fixtures"), list):
+        if isinstance(
+            data.get("fixtures"),
+            list
+        ):
             return data["fixtures"]
 
         return [data]
@@ -157,10 +199,36 @@ def normalize_fixtures(data):
 
 
 # =========================================================
-# EXTRAER PRECIO
+# INDEXAR POR FIXTURE ID
 # =========================================================
 
-def get_price(markets, market_id, outcome_id):
+def index_fixtures(data):
+
+    fixtures = normalize_fixtures(data)
+
+    result = {}
+
+    for fixture in fixtures:
+
+        fixture_id = fixture.get(
+            "fixtureId"
+        )
+
+        if fixture_id:
+            result[fixture_id] = fixture
+
+    return result
+
+
+# =========================================================
+# EXTRAER PRICE + TIMESTAMP
+# =========================================================
+
+def get_selection(
+    markets,
+    market_id,
+    outcome_id
+):
 
     market = markets.get(
         str(market_id),
@@ -191,23 +259,31 @@ def get_price(markets, market_id, outcome_id):
 
     for player in players.values():
 
-        if (
-            player.get("active")
-            and
-            player.get("price") is not None
-        ):
+        if not player.get("active"):
+            continue
 
-            try:
+        price = player.get("price")
 
-                price = float(
-                    player.get("price")
-                )
+        if price is None:
+            continue
 
-                if price > 1:
-                    return price
+        try:
+            price = float(price)
+        except Exception:
+            continue
 
-            except Exception:
-                pass
+        if price <= 1:
+            continue
+
+        return {
+            "price": price,
+            "changedAt": player.get(
+                "changedAt"
+            ),
+            "mainLine": player.get(
+                "mainLine"
+            )
+        }
 
     return None
 
@@ -218,94 +294,208 @@ def get_price(markets, market_id, outcome_id):
 
 def extract_market(markets, config):
 
-    prices = {}
+    result = {}
 
-    for name, outcome_id in config["outcomes"].items():
+    for (
+        selection_name,
+        outcome_id
+    ) in config["outcomes"].items():
 
-        price = get_price(
+        selection = get_selection(
             markets,
             config["market_id"],
             outcome_id
         )
 
-        if price is None:
+        if not selection:
             return None
 
-        prices[name] = price
-
-    return prices
-
-
-# =========================================================
-# QUITAR MARGEN
-# =========================================================
-
-def remove_vig(prices):
-
-    if not prices:
-        return None
-
-    probabilities = {}
-
-    total = 0.0
-
-    for selection, price in prices.items():
-
-        if not price or price <= 1:
-            return None
-
-        p = 1.0 / price
-
-        probabilities[selection] = p
-
-        total += p
-
-    if total <= 0:
-        return None
-
-    result = {}
-
-    for selection, probability in probabilities.items():
-
-        fair_probability = (
-            probability / total
-        )
-
-        fair_odds = (
-            1.0 / fair_probability
-        )
-
-        result[selection] = {
-
-            "probability":
-                fair_probability,
-
-            "fair_odds":
-                fair_odds
-        }
+        result[
+            selection_name
+        ] = selection
 
     return result
 
 
 # =========================================================
-# CLASIFICACIÓN PRELIMINAR
+# QUITAR VIG DE UNA CASA
 # =========================================================
 
-def value_score(edge):
+def remove_vig(market):
 
-    if edge >= 10:
-        return "A+"
+    implied = {}
+    total = 0.0
 
-    if edge >= 8:
-        return "A"
+    for (
+        selection,
+        data
+    ) in market.items():
 
-    if edge >= 5:
-        return "B"
+        price = data["price"]
 
-    if edge >= 3:
-        return "C"
+        probability = (
+            1.0 / price
+        )
 
-    return "PASS"
+        implied[
+            selection
+        ] = probability
+
+        total += probability
+
+    if total <= 0:
+        return None
+
+    fair = {}
+
+    for (
+        selection,
+        probability
+    ) in implied.items():
+
+        fair_probability = (
+            probability / total
+        )
+
+        fair[
+            selection
+        ] = {
+            "probability":
+                fair_probability,
+
+            "fair_odds":
+                1.0 / fair_probability
+        }
+
+    return fair
+
+
+# =========================================================
+# PARSEAR TIMESTAMP
+# =========================================================
+
+def parse_timestamp(value):
+
+    if not value:
+        return None
+
+    try:
+
+        return datetime.fromisoformat(
+            value.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# DIFERENCIA DE TIEMPO WINAMAX VS REFERENCIAS
+# =========================================================
+
+def timestamp_gap_hours(
+    win_timestamp,
+    reference_timestamps
+):
+
+    win_time = parse_timestamp(
+        win_timestamp
+    )
+
+    refs = [
+        parse_timestamp(x)
+        for x in reference_timestamps
+        if x
+    ]
+
+    refs = [
+        x for x in refs
+        if x is not None
+    ]
+
+    if (
+        win_time is None
+        or
+        not refs
+    ):
+        return None
+
+    newest_reference = max(refs)
+
+    gap = (
+        newest_reference
+        - win_time
+    ).total_seconds() / 3600
+
+    return round(
+        gap,
+        2
+    )
+
+
+# =========================================================
+# VALUE SCORE
+# =========================================================
+
+def calculate_score(
+    edge,
+    refs,
+    confirmations,
+    dispersion,
+    timestamp_gap,
+    price
+):
+
+    # Cuotas muy altas:
+    # más sensibles a pequeños cambios
+    if price > 6:
+        high_odds = True
+    else:
+        high_odds = False
+
+
+    # Posible precio muy atrasado
+    stale_warning = (
+        timestamp_gap is not None
+        and timestamp_gap > 6
+    )
+
+
+    if (
+        edge >= 8
+        and refs >= 3
+        and confirmations == refs
+        and dispersion <= 8
+        and not stale_warning
+        and not high_odds
+    ):
+        return "A+", "APTO"
+
+
+    if (
+        edge >= 6
+        and refs >= 2
+        and confirmations == refs
+        and dispersion <= 10
+        and not stale_warning
+        and not high_odds
+    ):
+        return "A", "APTO"
+
+
+    if (
+        edge >= 4
+        and refs >= 2
+        and confirmations >= 2
+        and dispersion <= 15
+    ):
+        return "B", "REVISAR"
+
+
+    return "PASS", "PASS"
 
 
 # =========================================================
@@ -320,25 +510,44 @@ def home():
         "status": "ok",
 
         "message":
-            "Winamax Value Scanner",
+            "Winamax Value Scanner V2",
 
         "rutas": {
-            "simple": "/simple",
-            "value": "/value",
-            "winamax_raw": "/scan"
+            "simple":
+                "/simple",
+
+            "value":
+                "/value",
+
+            "value_v2":
+                "/value-v2",
+
+            "quota":
+                "/quota"
         }
     })
 
 
 # =========================================================
-# SCAN WINAMAX RAW
+# QUOTA
+# /account NO GASTA PETICIONES
 # =========================================================
 
-@app.route("/scan")
-def scan():
+@app.route("/quota")
+def quota():
 
-    data, error = get_bookmaker_odds(
-        "winamax.es"
+    if not API_KEY:
+
+        return jsonify({
+            "error":
+                "ODDSPAPI_KEY no configurada"
+        }), 500
+
+    data, error = api_request(
+        ACCOUNT_URL,
+        {
+            "apiKey": API_KEY
+        }
     )
 
     if error:
@@ -346,6 +555,13 @@ def scan():
         return jsonify({
             "error": error
         }), 500
+
+    # Eliminamos la API key antes de devolver datos
+    if isinstance(data, dict):
+        data.pop(
+            "api_key",
+            None
+        )
 
     return jsonify(data)
 
@@ -357,8 +573,8 @@ def scan():
 @app.route("/simple")
 def simple():
 
-    data, error = get_bookmaker_odds(
-        "winamax.es"
+    raw, error = get_bookmaker_odds(
+        TARGET_BOOKMAKER
     )
 
     if error:
@@ -367,23 +583,27 @@ def simple():
             "error": error
         }), 500
 
-    fixtures = normalize_fixtures(data)
+    fixtures = normalize_fixtures(
+        raw
+    )
 
-    results = []
+    result = []
 
     for fixture in fixtures:
 
-        bookmaker_odds = fixture.get(
-            "bookmakerOdds",
-            {}
+        bookmaker_data = (
+            fixture
+            .get(
+                "bookmakerOdds",
+                {}
+            )
+            .get(
+                TARGET_BOOKMAKER,
+                {}
+            )
         )
 
-        winamax = bookmaker_odds.get(
-            "winamax.es",
-            {}
-        )
-
-        markets = winamax.get(
+        markets = bookmaker_data.get(
             "markets",
             {}
         )
@@ -391,7 +611,9 @@ def simple():
         partido = {
 
             "fixtureId":
-                fixture.get("fixtureId"),
+                fixture.get(
+                    "fixtureId"
+                ),
 
             "partido": (
                 f"{fixture.get('participant1Name', 'Local')} - "
@@ -399,121 +621,170 @@ def simple():
             )
         }
 
-        for market_name, config in MARKETS.items():
+        for (
+            market_name,
+            config
+        ) in MARKETS.items():
 
-            partido[
-                market_name
-            ] = extract_market(
+            extracted = extract_market(
                 markets,
                 config
             )
 
-        results.append(partido)
+            if not extracted:
+                partido[
+                    market_name
+                ] = None
+                continue
+
+            partido[
+                market_name
+            ] = {
+                selection:
+                    data["price"]
+
+                for (
+                    selection,
+                    data
+                ) in extracted.items()
+            }
+
+        result.append(
+            partido
+        )
 
     return jsonify({
 
         "status": "ok",
 
         "bookmaker":
-            "winamax.es",
+            TARGET_BOOKMAKER,
 
         "numero_partidos":
-            len(results),
+            len(result),
 
         "partidos":
-            results
+            result
     })
 
 
 # =========================================================
-# VALUE
-# WINAMAX VS PINNACLE
+# VALUE ANTIGUO
+# PINNACLE SOLAMENTE
 # =========================================================
 
 @app.route("/value")
-def value():
+def value_old():
 
-    # ---------------------------------
-    # PETICIÓN 1: WINAMAX
-    # ---------------------------------
+    return jsonify({
+        "status": "ok",
+        "message":
+            "Usa /value-v2 para el scanner multicasa"
+    })
 
-    winamax_raw, error_winamax = (
+
+# =========================================================
+# VALUE V2
+# =========================================================
+
+@app.route("/value-v2")
+def value_v2():
+
+    # =====================================================
+    # 1 - WINAMAX
+    # =====================================================
+
+    win_raw, win_error = (
         get_bookmaker_odds(
-            "winamax.es"
+            TARGET_BOOKMAKER
         )
     )
 
-    if error_winamax:
+    if win_error:
 
         return jsonify({
-            "error": "Error consultando Winamax",
-            "detalle": error_winamax
+            "error":
+                "Error consultando Winamax",
+
+            "detalle":
+                win_error
         }), 500
 
 
-    # ---------------------------------
-    # PETICIÓN 2: PINNACLE
-    # ---------------------------------
-
-    pinnacle_raw, error_pinnacle = (
-        get_bookmaker_odds(
-            "pinnacle"
-        )
+    win_index = index_fixtures(
+        win_raw
     )
 
-    if error_pinnacle:
+
+    # =====================================================
+    # 2 - CASAS SHARP
+    # =====================================================
+
+    reference_indexes = {}
+
+    reference_errors = {}
+
+    for bookmaker in REFERENCE_BOOKMAKERS:
+
+        raw, error = (
+            get_bookmaker_odds(
+                bookmaker
+            )
+        )
+
+        if error:
+
+            reference_errors[
+                bookmaker
+            ] = error
+
+            continue
+
+        reference_indexes[
+            bookmaker
+        ] = index_fixtures(
+            raw
+        )
+
+
+    # Necesitamos mínimo 2 casas sharp funcionando
+
+    if len(reference_indexes) < 2:
 
         return jsonify({
-            "error": "Error consultando Pinnacle",
-            "detalle": error_pinnacle
+
+            "status": "error",
+
+            "mensaje":
+                "No hay suficientes casas de referencia disponibles",
+
+            "referencias_ok":
+                list(
+                    reference_indexes.keys()
+                ),
+
+            "errores":
+                reference_errors
+
         }), 500
-
-
-    winamax_fixtures = normalize_fixtures(
-        winamax_raw
-    )
-
-    pinnacle_fixtures = normalize_fixtures(
-        pinnacle_raw
-    )
-
-
-    # ---------------------------------
-    # INDEXAMOS PINNACLE POR FIXTURE ID
-    # ---------------------------------
-
-    pinnacle_index = {}
-
-    for fixture in pinnacle_fixtures:
-
-        fixture_id = fixture.get(
-            "fixtureId"
-        )
-
-        if fixture_id:
-
-            pinnacle_index[
-                fixture_id
-            ] = fixture
 
 
     oportunidades = []
 
-    partidos_emparejados = 0
-    mercados_comparados = 0
+    markets_analyzed = 0
 
-    sin_pinnacle = []
+    fixtures_with_consensus = 0
 
 
-    # ---------------------------------
-    # RECORRER WINAMAX
-    # ---------------------------------
+    # =====================================================
+    # 3 - CADA PARTIDO WINAMAX
+    # =====================================================
 
-    for win_fixture in winamax_fixtures:
+    for (
+        fixture_id,
+        win_fixture
+    ) in win_index.items():
 
-        fixture_id = win_fixture.get(
-            "fixtureId"
-        )
 
         match_name = (
             f"{win_fixture.get('participant1Name', 'Local')} - "
@@ -521,52 +792,17 @@ def value():
         )
 
 
-        # Buscar mismo partido en Pinnacle
-
-        pin_fixture = pinnacle_index.get(
-            fixture_id
-        )
-
-        if not pin_fixture:
-
-            sin_pinnacle.append(
-                match_name
+        win_data = (
+            win_fixture
+            .get(
+                "bookmakerOdds",
+                {}
             )
-
-            continue
-
-
-        partidos_emparejados += 1
-
-
-        # Datos Winamax
-
-        win_bookmakers = win_fixture.get(
-            "bookmakerOdds",
-            {}
+            .get(
+                TARGET_BOOKMAKER,
+                {}
+            )
         )
-
-        win_data = win_bookmakers.get(
-            "winamax.es",
-            {}
-        )
-
-
-        # Datos Pinnacle
-
-        pin_bookmakers = pin_fixture.get(
-            "bookmakerOdds",
-            {}
-        )
-
-        pin_data = pin_bookmakers.get(
-            "pinnacle",
-            {}
-        )
-
-
-        if not win_data or not pin_data:
-            continue
 
 
         win_markets = win_data.get(
@@ -574,103 +810,390 @@ def value():
             {}
         )
 
-        pin_markets = pin_data.get(
-            "markets",
-            {}
-        )
+
+        match_had_consensus = False
 
 
-        # ---------------------------------
-        # COMPARAR MERCADOS
-        # ---------------------------------
+        # =================================================
+        # 4 - CADA MERCADO
+        # =================================================
 
-        for market_name, config in MARKETS.items():
+        for (
+            market_name,
+            config
+        ) in MARKETS.items():
 
-            win_prices = extract_market(
+
+            win_market = extract_market(
                 win_markets,
                 config
             )
 
-            pin_prices = extract_market(
-                pin_markets,
-                config
-            )
 
-
-            if not win_prices:
-                continue
-
-            if not pin_prices:
+            if not win_market:
                 continue
 
 
-            fair = remove_vig(
-                pin_prices
-            )
+            # ---------------------------------------------
+            # CREAR FAIR ODDS POR CASA DE REFERENCIA
+            # ---------------------------------------------
 
-            if not fair:
-                continue
+            ref_fair_markets = {}
 
-
-            mercados_comparados += 1
+            ref_raw_markets = {}
 
 
-            # ---------------------------------
-            # COMPARAR CADA SELECCIÓN
-            # ---------------------------------
+            for (
+                bookmaker,
+                fixture_index
+            ) in reference_indexes.items():
 
-            for selection, win_price in win_prices.items():
 
-                if selection not in fair:
+                reference_fixture = (
+                    fixture_index.get(
+                        fixture_id
+                    )
+                )
+
+
+                if not reference_fixture:
                     continue
 
 
-                probability = (
-                    fair[
-                        selection
-                    ][
-                        "probability"
+                reference_data = (
+                    reference_fixture
+                    .get(
+                        "bookmakerOdds",
+                        {}
+                    )
+                    .get(
+                        bookmaker,
+                        {}
+                    )
+                )
+
+
+                reference_markets = (
+                    reference_data.get(
+                        "markets",
+                        {}
+                    )
+                )
+
+
+                raw_market = extract_market(
+                    reference_markets,
+                    config
+                )
+
+
+                if not raw_market:
+                    continue
+
+
+                fair_market = remove_vig(
+                    raw_market
+                )
+
+
+                if not fair_market:
+                    continue
+
+
+                ref_raw_markets[
+                    bookmaker
+                ] = raw_market
+
+
+                ref_fair_markets[
+                    bookmaker
+                ] = fair_market
+
+
+            # Necesitamos mínimo 2 referencias
+
+            if len(ref_fair_markets) < 2:
+                continue
+
+
+            markets_analyzed += 1
+            match_had_consensus = True
+
+
+            # =================================================
+            # 5 - CADA SELECCIÓN
+            # =================================================
+
+            for (
+                selection,
+                win_selection
+            ) in win_market.items():
+
+
+                win_price = (
+                    win_selection[
+                        "price"
                     ]
                 )
 
 
-                fair_odds = (
-                    fair[
-                        selection
-                    ][
-                        "fair_odds"
-                    ]
+                probabilities = []
+
+                reference_details = {}
+
+                reference_times = []
+
+                confirmations = 0
+
+
+                for (
+                    bookmaker,
+                    fair_market
+                ) in ref_fair_markets.items():
+
+
+                    if selection not in fair_market:
+                        continue
+
+
+                    probability = (
+                        fair_market[
+                            selection
+                        ][
+                            "probability"
+                        ]
+                    )
+
+
+                    fair_odds = (
+                        fair_market[
+                            selection
+                        ][
+                            "fair_odds"
+                        ]
+                    )
+
+
+                    raw_price = (
+                        ref_raw_markets[
+                            bookmaker
+                        ][
+                            selection
+                        ][
+                            "price"
+                        ]
+                    )
+
+
+                    changed_at = (
+                        ref_raw_markets[
+                            bookmaker
+                        ][
+                            selection
+                        ].get(
+                            "changedAt"
+                        )
+                    )
+
+
+                    probabilities.append(
+                        probability
+                    )
+
+
+                    if changed_at:
+                        reference_times.append(
+                            changed_at
+                        )
+
+
+                    # Confirma value si Winamax supera
+                    # la cuota justa de esa casa
+
+                    if win_price > fair_odds:
+
+                        confirmations += 1
+
+
+                    reference_details[
+                        bookmaker
+                    ] = {
+
+                        "cuota":
+                            round(
+                                raw_price,
+                                3
+                            ),
+
+                        "cuota_justa":
+                            round(
+                                fair_odds,
+                                3
+                            ),
+
+                        "probabilidad_justa_pct":
+                            round(
+                                probability
+                                * 100,
+                                2
+                            )
+                    }
+
+
+                refs_count = len(
+                    probabilities
                 )
 
 
-                pinnacle_price = (
-                    pin_prices[
-                        selection
-                    ]
+                if refs_count < 2:
+                    continue
+
+
+                # ---------------------------------------------
+                # CONSENSO = MEDIANA DE PROBABILIDADES
+                # ---------------------------------------------
+
+                consensus_probability = (
+                    statistics.median(
+                        probabilities
+                    )
                 )
 
 
-                # EV / Edge contra probabilidad justa
+                consensus_fair_odds = (
+                    1.0
+                    /
+                    consensus_probability
+                )
+
+
+                # ---------------------------------------------
+                # DISPERSIÓN ENTRE CASAS
+                # ---------------------------------------------
+
+                min_probability = min(
+                    probabilities
+                )
+
+                max_probability = max(
+                    probabilities
+                )
+
+
+                dispersion = (
+                    (
+                        max_probability
+                        - min_probability
+                    )
+                    /
+                    consensus_probability
+                ) * 100
+
+
+                # ---------------------------------------------
+                # EDGE REAL VS CONSENSO
+                # ---------------------------------------------
 
                 edge = (
                     (
                         win_price
-                        * probability
+                        *
+                        consensus_probability
                     )
                     - 1
                 ) * 100
 
 
-                score = value_score(
-                    edge
-                )
-
-
-                # Solo mostramos >= 3%
+                # No nos interesa < 3 %
 
                 if edge < 3:
                     continue
 
+
+                # ---------------------------------------------
+                # DIFERENCIA TEMPORAL
+                # ---------------------------------------------
+
+                timestamp_gap = (
+                    timestamp_gap_hours(
+
+                        win_selection.get(
+                            "changedAt"
+                        ),
+
+                        reference_times
+                    )
+                )
+
+
+                # ---------------------------------------------
+                # SCORE
+                # ---------------------------------------------
+
+                score, decision = (
+                    calculate_score(
+
+                        edge=edge,
+
+                        refs=refs_count,
+
+                        confirmations=
+                            confirmations,
+
+                        dispersion=
+                            dispersion,
+
+                        timestamp_gap=
+                            timestamp_gap,
+
+                        price=
+                            win_price
+                    )
+                )
+
+
+                # ---------------------------------------------
+                # ALERTAS
+                # ---------------------------------------------
+
+                alertas = []
+
+
+                if dispersion > 10:
+
+                    alertas.append(
+                        "Alta dispersion entre referencias"
+                    )
+
+
+                if (
+                    timestamp_gap is not None
+                    and
+                    timestamp_gap > 6
+                ):
+
+                    alertas.append(
+                        "Winamax podria estar retrasado"
+                    )
+
+
+                if win_price > 6:
+
+                    alertas.append(
+                        "Cuota alta: mayor sensibilidad"
+                    )
+
+
+                if confirmations < refs_count:
+
+                    alertas.append(
+                        "No todas las casas confirman"
+                    )
+
+
+                # ---------------------------------------------
+                # GUARDAR
+                # ---------------------------------------------
 
                 oportunidades.append({
 
@@ -689,21 +1212,16 @@ def value():
                             3
                         ),
 
-                    "cuota_pinnacle":
+                    "probabilidad_consenso_pct":
                         round(
-                            pinnacle_price,
-                            3
-                        ),
-
-                    "probabilidad_referencia_pct":
-                        round(
-                            probability * 100,
+                            consensus_probability
+                            * 100,
                             2
                         ),
 
-                    "cuota_justa_pinnacle":
+                    "cuota_justa_consenso":
                         round(
-                            fair_odds,
+                            consensus_fair_odds,
                             3
                         ),
 
@@ -713,60 +1231,138 @@ def value():
                             2
                         ),
 
+                    "referencias_disponibles":
+                        refs_count,
+
+                    "referencias_confirmando":
+                        confirmations,
+
+                    "dispersion_pct":
+                        round(
+                            dispersion,
+                            2
+                        ),
+
+                    "gap_winamax_horas":
+                        timestamp_gap,
+
                     "value_score":
                         score,
 
-                    "decision_preliminar":
-                        (
-                            "CANDIDATO"
-                            if edge >= 5
-                            else
-                            "REVISAR"
-                        )
+                    "decision":
+                        decision,
+
+                    "alertas":
+                        alertas,
+
+                    "referencias":
+                        reference_details
                 })
 
 
-    # Ordenar de mayor edge a menor
+        if match_had_consensus:
+
+            fixtures_with_consensus += 1
+
+
+    # =====================================================
+    # ORDENAR
+    # APTO PRIMERO, DESPUÉS EDGE
+    # =====================================================
+
+    decision_order = {
+        "APTO": 0,
+        "REVISAR": 1,
+        "PASS": 2
+    }
+
 
     oportunidades.sort(
-        key=lambda x: x["edge_pct"],
-        reverse=True
+        key=lambda x: (
+            decision_order.get(
+                x["decision"],
+                9
+            ),
+            -x["edge_pct"]
+        )
     )
 
+
+    aptos = [
+        x
+        for x in oportunidades
+        if x["decision"] == "APTO"
+    ]
+
+
+    revisar = [
+        x
+        for x in oportunidades
+        if x["decision"] == "REVISAR"
+    ]
+
+
+    # =====================================================
+    # RESPUESTA
+    # =====================================================
 
     return jsonify({
 
         "status":
             "ok",
 
-        "metodo":
-            "Winamax vs Pinnacle sin margen",
+        "version":
+            "V2 multicasa",
 
-        "peticiones_api_usadas":
-            2,
+        "metodo":
+            "Winamax vs consenso sharp sin margen",
+
+        "referencias_configuradas":
+            REFERENCE_BOOKMAKERS,
+
+        "referencias_funcionando":
+            list(
+                reference_indexes.keys()
+            ),
+
+        "errores_referencias":
+            reference_errors,
+
+        "peticiones_api_estimadas":
+            1
+            +
+            len(
+                REFERENCE_BOOKMAKERS
+            ),
 
         "partidos_winamax":
-            len(winamax_fixtures),
+            len(
+                win_index
+            ),
 
-        "partidos_pinnacle":
-            len(pinnacle_fixtures),
+        "partidos_con_consenso":
+            fixtures_with_consensus,
 
-        "partidos_emparejados":
-            partidos_emparejados,
+        "mercados_analizados":
+            markets_analyzed,
 
-        "mercados_comparados":
-            mercados_comparados,
+        "numero_aptos":
+            len(
+                aptos
+            ),
 
-        "numero_oportunidades":
-            len(oportunidades),
+        "numero_revisar":
+            len(
+                revisar
+            ),
 
-        "filtro_edge_minimo_pct":
-            3,
+        "aptos":
+            aptos,
 
-        "sin_datos_pinnacle":
-            sin_pinnacle,
+        "revisar":
+            revisar,
 
-        "oportunidades":
+        "todas_oportunidades":
             oportunidades
     })
 
