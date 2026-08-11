@@ -1,8 +1,10 @@
 import os
+import time
+import threading
 import statistics
 import requests
 
-from datetime import datetime, timezone
+from datetime import datetime
 from flask import Flask, jsonify, request
 
 
@@ -13,7 +15,10 @@ app = Flask(__name__)
 # CONFIGURACIÓN
 # =========================================================
 
-API_KEY = os.environ.get("ODDSPAPI_KEY", "").strip()
+API_KEY = os.environ.get(
+    "ODDSPAPI_KEY",
+    ""
+).strip()
 
 BASE_URL = "https://api.oddspapi.io/v4"
 
@@ -27,6 +32,13 @@ REFERENCE_BOOKMAKERS = [
     "singbet",
     "sbobet"
 ]
+
+
+# Esperaremos un poco entre llamadas a odds-by-tournaments
+ODDS_MIN_INTERVAL = 0.90
+
+_last_odds_request = 0.0
+_odds_lock = threading.Lock()
 
 
 # =========================================================
@@ -87,7 +99,7 @@ MARKETS = {
 
 
 # =========================================================
-# SEGURIDAD: NO MOSTRAR API KEY EN ERRORES
+# OCULTAR API KEY EN ERRORES
 # =========================================================
 
 def sanitize_text(text):
@@ -107,53 +119,184 @@ def sanitize_text(text):
 
 
 # =========================================================
-# LLAMADA API
+# CONTROL DE VELOCIDAD
 # =========================================================
 
-def api_request(url, params):
+def wait_for_odds_slot():
+
+    global _last_odds_request
+
+    with _odds_lock:
+
+        now = time.monotonic()
+
+        elapsed = (
+            now
+            - _last_odds_request
+        )
+
+        wait_time = (
+            ODDS_MIN_INTERVAL
+            - elapsed
+        )
+
+        if wait_time > 0:
+            time.sleep(
+                wait_time
+            )
+
+        _last_odds_request = (
+            time.monotonic()
+        )
+
+
+# =========================================================
+# LEER RETRY DEL ERROR 429
+# =========================================================
+
+def get_retry_seconds(response):
 
     try:
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=30
+        data = response.json()
+
+        error = data.get(
+            "error",
+            {}
         )
 
-        response.raise_for_status()
+        retry_ms = error.get(
+            "retryMs"
+        )
 
-        return response.json(), None
+        if retry_ms is not None:
 
-    except requests.exceptions.RequestException as e:
+            return (
+                float(retry_ms)
+                / 1000.0
+            )
+
+    except Exception:
+        pass
+
+    return 1.0
+
+
+# =========================================================
+# LLAMADA API
+# CON REINTENTO AUTOMÁTICO PARA 429
+# =========================================================
+
+def api_request(
+    url,
+    params,
+    retries=2
+):
+
+    for attempt in range(
+        retries + 1
+    ):
 
         try:
-            detalle = response.text[:1000]
-        except Exception:
-            detalle = ""
 
-        return None, {
-            "mensaje": sanitize_text(str(e)),
-            "respuesta_api": sanitize_text(detalle)
-        }
+            if url == ODDS_URL:
+                wait_for_odds_slot()
 
-    except ValueError as e:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=30
+            )
 
-        return None, {
-            "mensaje": "Respuesta JSON no válida",
-            "detalle": sanitize_text(str(e))
-        }
+
+            # ---------------------------------------------
+            # RATE LIMIT
+            # ---------------------------------------------
+
+            if response.status_code == 429:
+
+                retry_seconds = (
+                    get_retry_seconds(
+                        response
+                    )
+                )
+
+                # Pequeño margen adicional
+                retry_seconds += 0.25
+
+                if attempt < retries:
+
+                    time.sleep(
+                        retry_seconds
+                    )
+
+                    continue
+
+
+            response.raise_for_status()
+
+            return (
+                response.json(),
+                None
+            )
+
+
+        except requests.exceptions.RequestException as e:
+
+            try:
+                detalle = (
+                    response.text[:1000]
+                )
+            except Exception:
+                detalle = ""
+
+            return None, {
+
+                "mensaje":
+                    sanitize_text(
+                        str(e)
+                    ),
+
+                "respuesta_api":
+                    sanitize_text(
+                        detalle
+                    )
+            }
+
+
+        except ValueError as e:
+
+            return None, {
+
+                "mensaje":
+                    "Respuesta JSON no válida",
+
+                "detalle":
+                    sanitize_text(
+                        str(e)
+                    )
+            }
+
+
+    return None, {
+        "mensaje":
+            "Se agotaron los reintentos"
+    }
 
 
 # =========================================================
 # OBTENER CUOTAS DE UNA CASA
 # =========================================================
 
-def get_bookmaker_odds(bookmaker):
+def get_bookmaker_odds(
+    bookmaker
+):
 
     if not API_KEY:
 
         return None, {
-            "mensaje": "ODDSPAPI_KEY no configurada"
+            "mensaje":
+                "ODDSPAPI_KEY no configurada"
         }
 
     tournament_id = request.args.get(
@@ -162,12 +305,24 @@ def get_bookmaker_odds(bookmaker):
     )
 
     params = {
-        "tournamentIds": tournament_id,
-        "bookmaker": bookmaker,
-        "language": "es",
-        "verbosity": 3,
-        "oddsFormat": "decimal",
-        "apiKey": API_KEY
+
+        "tournamentIds":
+            tournament_id,
+
+        "bookmaker":
+            bookmaker,
+
+        "language":
+            "es",
+
+        "verbosity":
+            3,
+
+        "oddsFormat":
+            "decimal",
+
+        "apiKey":
+            API_KEY
     }
 
     return api_request(
@@ -182,16 +337,27 @@ def get_bookmaker_odds(bookmaker):
 
 def normalize_fixtures(data):
 
-    if isinstance(data, list):
+    if isinstance(
+        data,
+        list
+    ):
         return data
 
-    if isinstance(data, dict):
+    if isinstance(
+        data,
+        dict
+    ):
 
         if isinstance(
-            data.get("fixtures"),
+            data.get(
+                "fixtures"
+            ),
             list
         ):
-            return data["fixtures"]
+
+            return data[
+                "fixtures"
+            ]
 
         return [data]
 
@@ -199,29 +365,38 @@ def normalize_fixtures(data):
 
 
 # =========================================================
-# INDEXAR POR FIXTURE ID
+# INDEXAR PARTIDOS
 # =========================================================
 
 def index_fixtures(data):
 
-    fixtures = normalize_fixtures(data)
+    fixtures = (
+        normalize_fixtures(
+            data
+        )
+    )
 
     result = {}
 
     for fixture in fixtures:
 
-        fixture_id = fixture.get(
-            "fixtureId"
+        fixture_id = (
+            fixture.get(
+                "fixtureId"
+            )
         )
 
         if fixture_id:
-            result[fixture_id] = fixture
+
+            result[
+                fixture_id
+            ] = fixture
 
     return result
 
 
 # =========================================================
-# EXTRAER PRICE + TIMESTAMP
+# SELECCIÓN: PRECIO + TIMESTAMP
 # =========================================================
 
 def get_selection(
@@ -231,7 +406,9 @@ def get_selection(
 ):
 
     market = markets.get(
-        str(market_id),
+        str(
+            market_id
+        ),
         {}
     )
 
@@ -244,12 +421,18 @@ def get_selection(
     ):
         return None
 
-    outcome = market.get(
-        "outcomes",
-        {}
-    ).get(
-        str(outcome_id),
-        {}
+    outcome = (
+        market
+        .get(
+            "outcomes",
+            {}
+        )
+        .get(
+            str(
+                outcome_id
+            ),
+            {}
+        )
     )
 
     players = outcome.get(
@@ -259,16 +442,24 @@ def get_selection(
 
     for player in players.values():
 
-        if not player.get("active"):
+        if not player.get(
+            "active"
+        ):
             continue
 
-        price = player.get("price")
+        price = player.get(
+            "price"
+        )
 
         if price is None:
             continue
 
         try:
-            price = float(price)
+
+            price = float(
+                price
+            )
+
         except Exception:
             continue
 
@@ -276,34 +467,50 @@ def get_selection(
             continue
 
         return {
-            "price": price,
-            "changedAt": player.get(
-                "changedAt"
-            ),
-            "mainLine": player.get(
-                "mainLine"
-            )
+
+            "price":
+                price,
+
+            "changedAt":
+                player.get(
+                    "changedAt"
+                ),
+
+            "mainLine":
+                player.get(
+                    "mainLine"
+                )
         }
 
     return None
 
 
 # =========================================================
-# EXTRAER MERCADO COMPLETO
+# EXTRAER MERCADO
 # =========================================================
 
-def extract_market(markets, config):
+def extract_market(
+    markets,
+    config
+):
 
     result = {}
 
     for (
         selection_name,
         outcome_id
-    ) in config["outcomes"].items():
+    ) in config[
+        "outcomes"
+    ].items():
 
         selection = get_selection(
+
             markets,
-            config["market_id"],
+
+            config[
+                "market_id"
+            ],
+
             outcome_id
         )
 
@@ -318,12 +525,15 @@ def extract_market(markets, config):
 
 
 # =========================================================
-# QUITAR VIG DE UNA CASA
+# QUITAR VIG
 # =========================================================
 
-def remove_vig(market):
+def remove_vig(
+    market
+):
 
-    implied = {}
+    probabilities = {}
+
     total = 0.0
 
     for (
@@ -331,50 +541,63 @@ def remove_vig(market):
         data
     ) in market.items():
 
-        price = data["price"]
+        price = data[
+            "price"
+        ]
 
         probability = (
-            1.0 / price
+            1.0
+            / price
         )
 
-        implied[
+        probabilities[
             selection
         ] = probability
 
         total += probability
 
+
     if total <= 0:
         return None
+
 
     fair = {}
 
     for (
         selection,
         probability
-    ) in implied.items():
+    ) in probabilities.items():
 
         fair_probability = (
-            probability / total
+            probability
+            / total
         )
 
         fair[
             selection
         ] = {
+
             "probability":
                 fair_probability,
 
             "fair_odds":
-                1.0 / fair_probability
+                (
+                    1.0
+                    /
+                    fair_probability
+                )
         }
 
     return fair
 
 
 # =========================================================
-# PARSEAR TIMESTAMP
+# TIMESTAMP
 # =========================================================
 
-def parse_timestamp(value):
+def parse_timestamp(
+    value
+):
 
     if not value:
         return None
@@ -393,7 +616,7 @@ def parse_timestamp(value):
 
 
 # =========================================================
-# DIFERENCIA DE TIEMPO WINAMAX VS REFERENCIAS
+# DIFERENCIA TEMPORAL
 # =========================================================
 
 def timestamp_gap_hours(
@@ -405,16 +628,19 @@ def timestamp_gap_hours(
         win_timestamp
     )
 
-    refs = [
-        parse_timestamp(x)
-        for x in reference_timestamps
-        if x
-    ]
+    refs = []
 
-    refs = [
-        x for x in refs
-        if x is not None
-    ]
+    for value in reference_timestamps:
+
+        parsed = parse_timestamp(
+            value
+        )
+
+        if parsed:
+            refs.append(
+                parsed
+            )
+
 
     if (
         win_time is None
@@ -423,12 +649,19 @@ def timestamp_gap_hours(
     ):
         return None
 
-    newest_reference = max(refs)
+
+    newest_reference = max(
+        refs
+    )
+
 
     gap = (
+
         newest_reference
         - win_time
+
     ).total_seconds() / 3600
+
 
     return round(
         gap,
@@ -437,7 +670,7 @@ def timestamp_gap_hours(
 
 
 # =========================================================
-# VALUE SCORE
+# SCORE
 # =========================================================
 
 def calculate_score(
@@ -449,42 +682,62 @@ def calculate_score(
     price
 ):
 
-    # Cuotas muy altas:
-    # más sensibles a pequeños cambios
-    if price > 6:
-        high_odds = True
-    else:
-        high_odds = False
-
-
-    # Posible precio muy atrasado
-    stale_warning = (
-        timestamp_gap is not None
-        and timestamp_gap > 6
+    high_odds = (
+        price > 6
     )
 
+    stale = (
+
+        timestamp_gap
+        is not None
+
+        and
+
+        timestamp_gap > 6
+    )
+
+
+    # ---------------------------------------------
+    # A+
+    # ---------------------------------------------
 
     if (
         edge >= 8
         and refs >= 3
         and confirmations == refs
         and dispersion <= 8
-        and not stale_warning
+        and not stale
         and not high_odds
     ):
-        return "A+", "APTO"
 
+        return (
+            "A+",
+            "APTO"
+        )
+
+
+    # ---------------------------------------------
+    # A
+    # ---------------------------------------------
 
     if (
         edge >= 6
         and refs >= 2
         and confirmations == refs
         and dispersion <= 10
-        and not stale_warning
+        and not stale
         and not high_odds
     ):
-        return "A", "APTO"
 
+        return (
+            "A",
+            "APTO"
+        )
+
+
+    # ---------------------------------------------
+    # B
+    # ---------------------------------------------
 
     if (
         edge >= 4
@@ -492,10 +745,17 @@ def calculate_score(
         and confirmations >= 2
         and dispersion <= 15
     ):
-        return "B", "REVISAR"
+
+        return (
+            "B",
+            "REVISAR"
+        )
 
 
-    return "PASS", "PASS"
+    return (
+        "PASS",
+        "PASS"
+    )
 
 
 # =========================================================
@@ -507,17 +767,16 @@ def home():
 
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "message":
             "Winamax Value Scanner V2",
 
         "rutas": {
+
             "simple":
                 "/simple",
-
-            "value":
-                "/value",
 
             "value_v2":
                 "/value-v2",
@@ -530,7 +789,6 @@ def home():
 
 # =========================================================
 # QUOTA
-# /account NO GASTA PETICIONES
 # =========================================================
 
 @app.route("/quota")
@@ -543,55 +801,81 @@ def quota():
                 "ODDSPAPI_KEY no configurada"
         }), 500
 
+
     data, error = api_request(
+
         ACCOUNT_URL,
+
         {
-            "apiKey": API_KEY
+            "apiKey":
+                API_KEY
         }
     )
+
 
     if error:
 
         return jsonify({
-            "error": error
+            "error":
+                error
         }), 500
 
-    # Eliminamos la API key antes de devolver datos
-    if isinstance(data, dict):
+
+    if isinstance(
+        data,
+        dict
+    ):
+
         data.pop(
             "api_key",
             None
         )
 
-    return jsonify(data)
+        data.pop(
+            "apiKey",
+            None
+        )
+
+
+    return jsonify(
+        data
+    )
 
 
 # =========================================================
-# SIMPLE WINAMAX
+# SIMPLE
 # =========================================================
 
 @app.route("/simple")
 def simple():
 
-    raw, error = get_bookmaker_odds(
-        TARGET_BOOKMAKER
+    raw, error = (
+        get_bookmaker_odds(
+            TARGET_BOOKMAKER
+        )
     )
 
     if error:
 
         return jsonify({
-            "error": error
+            "error":
+                error
         }), 500
 
-    fixtures = normalize_fixtures(
-        raw
+
+    fixtures = (
+        normalize_fixtures(
+            raw
+        )
     )
 
-    result = []
+    results = []
+
 
     for fixture in fixtures:
 
         bookmaker_data = (
+
             fixture
             .get(
                 "bookmakerOdds",
@@ -603,10 +887,14 @@ def simple():
             )
         )
 
-        markets = bookmaker_data.get(
-            "markets",
-            {}
+
+        markets = (
+            bookmaker_data.get(
+                "markets",
+                {}
+            )
         )
+
 
         partido = {
 
@@ -621,65 +909,65 @@ def simple():
             )
         }
 
+
         for (
             market_name,
             config
         ) in MARKETS.items():
 
-            extracted = extract_market(
-                markets,
-                config
+            extracted = (
+                extract_market(
+                    markets,
+                    config
+                )
             )
 
+
             if not extracted:
+
                 partido[
                     market_name
                 ] = None
+
                 continue
+
 
             partido[
                 market_name
             ] = {
+
                 selection:
-                    data["price"]
+                    item[
+                        "price"
+                    ]
 
                 for (
                     selection,
-                    data
+                    item
                 ) in extracted.items()
             }
 
-        result.append(
+
+        results.append(
             partido
         )
 
+
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "bookmaker":
             TARGET_BOOKMAKER,
 
         "numero_partidos":
-            len(result),
+            len(
+                results
+            ),
 
         "partidos":
-            result
-    })
-
-
-# =========================================================
-# VALUE ANTIGUO
-# PINNACLE SOLAMENTE
-# =========================================================
-
-@app.route("/value")
-def value_old():
-
-    return jsonify({
-        "status": "ok",
-        "message":
-            "Usa /value-v2 para el scanner multicasa"
+            results
     })
 
 
@@ -690,9 +978,9 @@ def value_old():
 @app.route("/value-v2")
 def value_v2():
 
-    # =====================================================
-    # 1 - WINAMAX
-    # =====================================================
+    # ---------------------------------------------
+    # WINAMAX
+    # ---------------------------------------------
 
     win_raw, win_error = (
         get_bookmaker_odds(
@@ -700,37 +988,46 @@ def value_v2():
         )
     )
 
+
     if win_error:
 
         return jsonify({
+
             "error":
                 "Error consultando Winamax",
 
             "detalle":
                 win_error
+
         }), 500
 
 
-    win_index = index_fixtures(
-        win_raw
+    win_index = (
+        index_fixtures(
+            win_raw
+        )
     )
 
 
-    # =====================================================
-    # 2 - CASAS SHARP
-    # =====================================================
+    # ---------------------------------------------
+    # REFERENCIAS
+    # ---------------------------------------------
 
     reference_indexes = {}
 
     reference_errors = {}
 
-    for bookmaker in REFERENCE_BOOKMAKERS:
+
+    for bookmaker in (
+        REFERENCE_BOOKMAKERS
+    ):
 
         raw, error = (
             get_bookmaker_odds(
                 bookmaker
             )
         )
+
 
         if error:
 
@@ -740,20 +1037,28 @@ def value_v2():
 
             continue
 
+
         reference_indexes[
             bookmaker
-        ] = index_fixtures(
-            raw
+        ] = (
+            index_fixtures(
+                raw
+            )
         )
 
 
-    # Necesitamos mínimo 2 casas sharp funcionando
+    # ---------------------------------------------
+    # MÍNIMO 2 REFERENCIAS
+    # ---------------------------------------------
 
-    if len(reference_indexes) < 2:
+    if len(
+        reference_indexes
+    ) < 2:
 
         return jsonify({
 
-            "status": "error",
+            "status":
+                "error",
 
             "mensaje":
                 "No hay suficientes casas de referencia disponibles",
@@ -771,13 +1076,13 @@ def value_v2():
 
     oportunidades = []
 
-    markets_analyzed = 0
+    mercados_analizados = 0
 
-    fixtures_with_consensus = 0
+    partidos_consenso = 0
 
 
     # =====================================================
-    # 3 - CADA PARTIDO WINAMAX
+    # RECORRER PARTIDOS
     # =====================================================
 
     for (
@@ -786,13 +1091,15 @@ def value_v2():
     ) in win_index.items():
 
 
-        match_name = (
+        partido_nombre = (
+
             f"{win_fixture.get('participant1Name', 'Local')} - "
             f"{win_fixture.get('participant2Name', 'Visitante')}"
         )
 
 
         win_data = (
+
             win_fixture
             .get(
                 "bookmakerOdds",
@@ -811,11 +1118,11 @@ def value_v2():
         )
 
 
-        match_had_consensus = False
+        partido_con_consenso = False
 
 
         # =================================================
-        # 4 - CADA MERCADO
+        # MERCADOS
         # =================================================
 
         for (
@@ -824,9 +1131,11 @@ def value_v2():
         ) in MARKETS.items():
 
 
-            win_market = extract_market(
-                win_markets,
-                config
+            win_market = (
+                extract_market(
+                    win_markets,
+                    config
+                )
             )
 
 
@@ -834,14 +1143,13 @@ def value_v2():
                 continue
 
 
+            ref_fair = {}
+            ref_raw = {}
+
+
             # ---------------------------------------------
-            # CREAR FAIR ODDS POR CASA DE REFERENCIA
+            # REFERENCIAS DEL MISMO PARTIDO
             # ---------------------------------------------
-
-            ref_fair_markets = {}
-
-            ref_raw_markets = {}
-
 
             for (
                 bookmaker,
@@ -849,19 +1157,20 @@ def value_v2():
             ) in reference_indexes.items():
 
 
-                reference_fixture = (
+                ref_fixture = (
                     fixture_index.get(
                         fixture_id
                     )
                 )
 
 
-                if not reference_fixture:
+                if not ref_fixture:
                     continue
 
 
-                reference_data = (
-                    reference_fixture
+                ref_data = (
+
+                    ref_fixture
                     .get(
                         "bookmakerOdds",
                         {}
@@ -873,17 +1182,19 @@ def value_v2():
                 )
 
 
-                reference_markets = (
-                    reference_data.get(
+                ref_markets = (
+                    ref_data.get(
                         "markets",
                         {}
                     )
                 )
 
 
-                raw_market = extract_market(
-                    reference_markets,
-                    config
+                raw_market = (
+                    extract_market(
+                        ref_markets,
+                        config
+                    )
                 )
 
 
@@ -891,8 +1202,10 @@ def value_v2():
                     continue
 
 
-                fair_market = remove_vig(
-                    raw_market
+                fair_market = (
+                    remove_vig(
+                        raw_market
+                    )
                 )
 
 
@@ -900,28 +1213,30 @@ def value_v2():
                     continue
 
 
-                ref_raw_markets[
+                ref_raw[
                     bookmaker
                 ] = raw_market
 
 
-                ref_fair_markets[
+                ref_fair[
                     bookmaker
                 ] = fair_market
 
 
-            # Necesitamos mínimo 2 referencias
+            if len(
+                ref_fair
+            ) < 2:
 
-            if len(ref_fair_markets) < 2:
                 continue
 
 
-            markets_analyzed += 1
-            match_had_consensus = True
+            mercados_analizados += 1
+
+            partido_con_consenso = True
 
 
             # =================================================
-            # 5 - CADA SELECCIÓN
+            # SELECCIONES
             # =================================================
 
             for (
@@ -939,7 +1254,7 @@ def value_v2():
 
                 probabilities = []
 
-                reference_details = {}
+                referencias = {}
 
                 reference_times = []
 
@@ -949,14 +1264,18 @@ def value_v2():
                 for (
                     bookmaker,
                     fair_market
-                ) in ref_fair_markets.items():
+                ) in ref_fair.items():
 
 
-                    if selection not in fair_market:
+                    if (
+                        selection
+                        not in fair_market
+                    ):
                         continue
 
 
                     probability = (
+
                         fair_market[
                             selection
                         ][
@@ -966,6 +1285,7 @@ def value_v2():
 
 
                     fair_odds = (
+
                         fair_market[
                             selection
                         ][
@@ -975,7 +1295,8 @@ def value_v2():
 
 
                     raw_price = (
-                        ref_raw_markets[
+
+                        ref_raw[
                             bookmaker
                         ][
                             selection
@@ -986,7 +1307,8 @@ def value_v2():
 
 
                     changed_at = (
-                        ref_raw_markets[
+
+                        ref_raw[
                             bookmaker
                         ][
                             selection
@@ -1002,20 +1324,21 @@ def value_v2():
 
 
                     if changed_at:
+
                         reference_times.append(
                             changed_at
                         )
 
 
-                    # Confirma value si Winamax supera
-                    # la cuota justa de esa casa
-
-                    if win_price > fair_odds:
+                    if (
+                        win_price
+                        > fair_odds
+                    ):
 
                         confirmations += 1
 
 
-                    reference_details[
+                    referencias[
                         bookmaker
                     ] = {
 
@@ -1050,7 +1373,7 @@ def value_v2():
 
 
                 # ---------------------------------------------
-                # CONSENSO = MEDIANA DE PROBABILIDADES
+                # CONSENSO
                 # ---------------------------------------------
 
                 consensus_probability = (
@@ -1061,6 +1384,7 @@ def value_v2():
 
 
                 consensus_fair_odds = (
+
                     1.0
                     /
                     consensus_probability
@@ -1068,53 +1392,58 @@ def value_v2():
 
 
                 # ---------------------------------------------
-                # DISPERSIÓN ENTRE CASAS
+                # DISPERSIÓN
                 # ---------------------------------------------
 
-                min_probability = min(
+                min_p = min(
                     probabilities
                 )
 
-                max_probability = max(
+                max_p = max(
                     probabilities
                 )
 
 
                 dispersion = (
+
                     (
-                        max_probability
-                        - min_probability
+                        max_p
+                        - min_p
                     )
+
                     /
+
                     consensus_probability
+
                 ) * 100
 
 
                 # ---------------------------------------------
-                # EDGE REAL VS CONSENSO
+                # EDGE
                 # ---------------------------------------------
 
                 edge = (
+
                     (
                         win_price
                         *
                         consensus_probability
                     )
+
                     - 1
+
                 ) * 100
 
-
-                # No nos interesa < 3 %
 
                 if edge < 3:
                     continue
 
 
                 # ---------------------------------------------
-                # DIFERENCIA TEMPORAL
+                # FRESCURA
                 # ---------------------------------------------
 
-                timestamp_gap = (
+                gap = (
                     timestamp_gap_hours(
 
                         win_selection.get(
@@ -1133,9 +1462,11 @@ def value_v2():
                 score, decision = (
                     calculate_score(
 
-                        edge=edge,
+                        edge=
+                            edge,
 
-                        refs=refs_count,
+                        refs=
+                            refs_count,
 
                         confirmations=
                             confirmations,
@@ -1144,7 +1475,7 @@ def value_v2():
                             dispersion,
 
                         timestamp_gap=
-                            timestamp_gap,
+                            gap,
 
                         price=
                             win_price
@@ -1167,9 +1498,9 @@ def value_v2():
 
 
                 if (
-                    timestamp_gap is not None
+                    gap is not None
                     and
-                    timestamp_gap > 6
+                    gap > 6
                 ):
 
                     alertas.append(
@@ -1180,25 +1511,21 @@ def value_v2():
                 if win_price > 6:
 
                     alertas.append(
-                        "Cuota alta: mayor sensibilidad"
+                        "Cuota alta"
                     )
 
 
                 if confirmations < refs_count:
 
                     alertas.append(
-                        "No todas las casas confirman"
+                        "No todas las referencias confirman"
                     )
 
-
-                # ---------------------------------------------
-                # GUARDAR
-                # ---------------------------------------------
 
                 oportunidades.append({
 
                     "partido":
-                        match_name,
+                        partido_nombre,
 
                     "mercado":
                         market_name,
@@ -1244,7 +1571,7 @@ def value_v2():
                         ),
 
                     "gap_winamax_horas":
-                        timestamp_gap,
+                        gap,
 
                     "value_score":
                         score,
@@ -1256,21 +1583,20 @@ def value_v2():
                         alertas,
 
                     "referencias":
-                        reference_details
+                        referencias
                 })
 
 
-        if match_had_consensus:
+        if partido_con_consenso:
 
-            fixtures_with_consensus += 1
+            partidos_consenso += 1
 
 
     # =====================================================
-    # ORDENAR
-    # APTO PRIMERO, DESPUÉS EDGE
+    # ORDEN
     # =====================================================
 
-    decision_order = {
+    orden = {
         "APTO": 0,
         "REVISAR": 1,
         "PASS": 2
@@ -1278,27 +1604,42 @@ def value_v2():
 
 
     oportunidades.sort(
+
         key=lambda x: (
-            decision_order.get(
-                x["decision"],
+
+            orden.get(
+                x[
+                    "decision"
+                ],
                 9
             ),
-            -x["edge_pct"]
+
+            -x[
+                "edge_pct"
+            ]
         )
     )
 
 
     aptos = [
+
         x
         for x in oportunidades
-        if x["decision"] == "APTO"
+
+        if x[
+            "decision"
+        ] == "APTO"
     ]
 
 
     revisar = [
+
         x
         for x in oportunidades
-        if x["decision"] == "REVISAR"
+
+        if x[
+            "decision"
+        ] == "REVISAR"
     ]
 
 
@@ -1312,10 +1653,10 @@ def value_v2():
             "ok",
 
         "version":
-            "V2 multicasa",
+            "V2 multicasa rate-limit-safe",
 
         "metodo":
-            "Winamax vs consenso sharp sin margen",
+            "Winamax vs consenso sin margen",
 
         "referencias_configuradas":
             REFERENCE_BOOKMAKERS,
@@ -1328,12 +1669,8 @@ def value_v2():
         "errores_referencias":
             reference_errors,
 
-        "peticiones_api_estimadas":
-            1
-            +
-            len(
-                REFERENCE_BOOKMAKERS
-            ),
+        "intervalo_entre_peticiones_segundos":
+            ODDS_MIN_INTERVAL,
 
         "partidos_winamax":
             len(
@@ -1341,10 +1678,10 @@ def value_v2():
             ),
 
         "partidos_con_consenso":
-            fixtures_with_consensus,
+            partidos_consenso,
 
         "mercados_analizados":
-            markets_analyzed,
+            mercados_analizados,
 
         "numero_aptos":
             len(
@@ -1360,10 +1697,7 @@ def value_v2():
             aptos,
 
         "revisar":
-            revisar,
-
-        "todas_oportunidades":
-            oportunidades
+            revisar
     })
 
 
