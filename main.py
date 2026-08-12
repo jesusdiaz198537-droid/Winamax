@@ -4,8 +4,9 @@ import threading
 import statistics
 import requests
 
-from datetime import datetime, timezone
-from flask import Flask, jsonify, request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from flask import Flask, jsonify
 
 
 app = Flask(__name__)
@@ -15,10 +16,16 @@ app = Flask(__name__)
 # CONFIGURACIÓN
 # =========================================================
 
-API_KEY = os.environ.get("ODDSPAPI_KEY", "").strip()
+API_KEY = os.environ.get(
+    "ODDSPAPI_KEY",
+    ""
+).strip()
 
-ODDS_URL = "https://api.oddspapi.io/v4/odds-by-tournaments"
-ACCOUNT_URL = "https://api.oddspapi.io/v4/account"
+BASE_URL = "https://api.oddspapi.io/v4"
+
+FIXTURES_URL = f"{BASE_URL}/fixtures"
+ODDS_URL = f"{BASE_URL}/odds-by-tournaments"
+ACCOUNT_URL = f"{BASE_URL}/account"
 
 TARGET_BOOKMAKER = "winamax.es"
 
@@ -28,11 +35,22 @@ REFERENCE_BOOKMAKERS = [
     "sbobet"
 ]
 
-# OddsPapi documenta 1000 ms.
-# Dejamos un pequeño margen.
-ODDS_MIN_INTERVAL = 1.10
+LOCAL_TZ = ZoneInfo(
+    "Atlantic/Canary"
+)
 
-_last_request = 0.0
+
+# =========================================================
+# RATE LIMITS
+# =========================================================
+
+ENDPOINT_INTERVALS = {
+    FIXTURES_URL: 2.10,
+    ODDS_URL: 1.10
+}
+
+_last_request = {}
+
 _request_lock = threading.Lock()
 
 
@@ -43,7 +61,9 @@ _request_lock = threading.Lock()
 MARKETS = {
 
     "1X2": {
+
         "market_id": "101",
+
         "outcomes": {
             "Local": "101",
             "Empate": "102",
@@ -52,7 +72,9 @@ MARKETS = {
     },
 
     "Ambos marcan": {
+
         "market_id": "104",
+
         "outcomes": {
             "Si": "104",
             "No": "105"
@@ -60,7 +82,9 @@ MARKETS = {
     },
 
     "Over Under 1.5": {
+
         "market_id": "108",
+
         "outcomes": {
             "Over 1.5": "108",
             "Under 1.5": "109"
@@ -68,7 +92,9 @@ MARKETS = {
     },
 
     "Over Under 2.5": {
+
         "market_id": "1010",
+
         "outcomes": {
             "Over 2.5": "1010",
             "Under 2.5": "1011"
@@ -76,18 +102,12 @@ MARKETS = {
     },
 
     "Over Under 3.5": {
+
         "market_id": "1012",
+
         "outcomes": {
             "Over 3.5": "1012",
             "Under 3.5": "1013"
-        }
-    },
-
-    "Over Under 4.5": {
-        "market_id": "1014",
-        "outcomes": {
-            "Over 4.5": "1014",
-            "Under 4.5": "1015"
         }
     }
 }
@@ -105,6 +125,7 @@ def sanitize(text):
     text = str(text)
 
     if API_KEY:
+
         text = text.replace(
             API_KEY,
             "***OCULTA***"
@@ -117,35 +138,56 @@ def sanitize(text):
 # RATE LIMIT
 # =========================================================
 
-def wait_request_slot():
+def wait_request_slot(url):
 
-    global _last_request
+    interval = ENDPOINT_INTERVALS.get(
+        url,
+        0
+    )
+
+    if interval <= 0:
+        return
+
 
     with _request_lock:
 
+        now = time.monotonic()
+
+        last = _last_request.get(
+            url,
+            0
+        )
+
         elapsed = (
-            time.monotonic()
-            - _last_request
+            now
+            - last
         )
 
         wait_time = (
-            ODDS_MIN_INTERVAL
+            interval
             - elapsed
         )
 
-        if wait_time > 0:
-            time.sleep(wait_time)
 
-        _last_request = (
-            time.monotonic()
-        )
+        if wait_time > 0:
+
+            time.sleep(
+                wait_time
+            )
+
+
+        _last_request[
+            url
+        ] = time.monotonic()
 
 
 # =========================================================
 # RETRY 429
 # =========================================================
 
-def get_retry_seconds(response):
+def get_retry_seconds(
+    response
+):
 
     try:
 
@@ -153,104 +195,297 @@ def get_retry_seconds(response):
 
         retry_ms = (
             data
-            .get("error", {})
-            .get("retryMs")
+            .get(
+                "error",
+                {}
+            )
+            .get(
+                "retryMs"
+            )
         )
 
+
         if retry_ms is not None:
-            return float(retry_ms) / 1000
+
+            return (
+                float(
+                    retry_ms
+                )
+                /
+                1000.0
+            )
 
     except Exception:
         pass
 
-    return 1.1
+
+    return 1.5
 
 
 # =========================================================
 # API REQUEST
 # =========================================================
 
-def api_request(url, params, retries=3):
+def api_request(
+    url,
+    params,
+    retries=3
+):
 
-    for attempt in range(retries + 1):
+    response = None
+
+
+    for attempt in range(
+        retries + 1
+    ):
 
         try:
 
-            if url == ODDS_URL:
-                wait_request_slot()
-
-            response = requests.get(
-                url,
-                params=params,
-                timeout=30
+            wait_request_slot(
+                url
             )
 
-            if response.status_code == 429:
 
-                if attempt < retries:
+            response = requests.get(
 
-                    wait = (
-                        get_retry_seconds(response)
-                        + 0.30
+                url,
+
+                params=params,
+
+                timeout=45
+            )
+
+
+            if (
+                response.status_code == 429
+                and
+                attempt < retries
+            ):
+
+                time.sleep(
+
+                    get_retry_seconds(
+                        response
                     )
+                    + 0.30
+                )
 
-                    time.sleep(wait)
+                continue
 
-                    continue
 
             response.raise_for_status()
 
-            return response.json(), None
+
+            return (
+                response.json(),
+                None
+            )
 
 
         except requests.exceptions.RequestException as e:
 
-            try:
-                detail = response.text[:1000]
-            except Exception:
-                detail = ""
+            detail = ""
+
+
+            if response is not None:
+
+                try:
+
+                    detail = (
+                        response.text[
+                            :1000
+                        ]
+                    )
+
+                except Exception:
+                    pass
+
 
             return None, {
-                "mensaje": sanitize(str(e)),
-                "respuesta_api": sanitize(detail)
+
+                "mensaje":
+                    sanitize(
+                        str(e)
+                    ),
+
+                "respuesta_api":
+                    sanitize(
+                        detail
+                    )
             }
 
 
         except ValueError as e:
 
             return None, {
-                "mensaje": "JSON no válido",
-                "detalle": sanitize(str(e))
+
+                "mensaje":
+                    "OddsPapi no devolvió JSON válido",
+
+                "detalle":
+                    sanitize(
+                        str(e)
+                    )
             }
 
+
     return None, {
-        "mensaje": "Reintentos agotados"
+        "mensaje":
+            "Se agotaron los reintentos"
     }
 
 
 # =========================================================
-# OBTENER CUOTAS
+# FECHA DE HOY
+# EN HORA CANARIA
 # =========================================================
 
-def get_bookmaker_odds(bookmaker):
+def today_utc_range():
+
+    now_local = datetime.now(
+        LOCAL_TZ
+    )
+
+
+    start_local = now_local.replace(
+
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+
+    end_local = (
+        start_local
+        +
+        timedelta(
+            days=1
+        )
+    )
+
+
+    start_utc = (
+        start_local
+        .astimezone(
+            timezone.utc
+        )
+    )
+
+
+    end_utc = (
+        end_local
+        .astimezone(
+            timezone.utc
+        )
+    )
+
+
+    return (
+
+        start_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+
+        end_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+
+        start_local.date().isoformat()
+    )
+
+
+# =========================================================
+# TODOS LOS PARTIDOS DE HOY EN WINAMAX
+# =========================================================
+
+def get_today_winamax_fixtures():
 
     if not API_KEY:
 
         return None, {
+
             "mensaje":
                 "ODDSPAPI_KEY no configurada"
         }
 
-    tournament_id = request.args.get(
-        "tournamentId",
-        "7"
+
+    start_utc, end_utc, local_date = (
+        today_utc_range()
     )
+
+
+    params = {
+
+        "sportId":
+            10,
+
+        "from":
+            start_utc,
+
+        "to":
+            end_utc,
+
+        "statusId":
+            0,
+
+        "hasOdds":
+            "true",
+
+        "bookmakers":
+            TARGET_BOOKMAKER,
+
+        "language":
+            "es",
+
+        "apiKey":
+            API_KEY
+    }
+
+
+    data, error = api_request(
+
+        FIXTURES_URL,
+
+        params
+    )
+
+
+    return (
+        data,
+        error
+    )
+
+
+# =========================================================
+# CUOTAS DE UNA CASA
+# PARA TODOS LOS TORNEOS
+# =========================================================
+
+def get_bookmaker_odds(
+    bookmaker,
+    tournament_ids
+):
+
+    if not tournament_ids:
+
+        return (
+            [],
+            None
+        )
+
 
     params = {
 
         "tournamentIds":
-            tournament_id,
+            ",".join(
+                str(x)
+                for x
+                in tournament_ids
+            ),
 
+        # El servidor actual de OddsPapi
+        # nos exige una casa por petición
         "bookmaker":
             bookmaker,
 
@@ -267,95 +502,116 @@ def get_bookmaker_odds(bookmaker):
             API_KEY
     }
 
+
     return api_request(
+
         ODDS_URL,
+
         params
     )
 
 
 # =========================================================
-# FIXTURES
+# NORMALIZAR FIXTURES
 # =========================================================
 
-def normalize_fixtures(data):
+def normalize_fixtures(
+    data
+):
 
-    if isinstance(data, list):
+    if isinstance(
+        data,
+        list
+    ):
+
         return data
 
-    if isinstance(data, dict):
+
+    if isinstance(
+        data,
+        dict
+    ):
 
         if isinstance(
-            data.get("fixtures"),
+            data.get(
+                "fixtures"
+            ),
             list
         ):
-            return data["fixtures"]
 
-        return [data]
+            return data[
+                "fixtures"
+            ]
+
+
+        return [
+            data
+        ]
+
 
     return []
 
 
-def index_fixtures(data):
+# =========================================================
+# INDEXAR FIXTURES
+# =========================================================
+
+def index_fixtures(
+    data,
+    allowed_ids=None
+):
+
+    allowed = (
+
+        set(
+            allowed_ids
+        )
+
+        if allowed_ids
+
+        else None
+    )
+
 
     result = {}
 
-    for fixture in normalize_fixtures(data):
 
-        fixture_id = fixture.get(
-            "fixtureId"
+    for fixture in (
+        normalize_fixtures(
+            data
+        )
+    ):
+
+        fixture_id = (
+            fixture.get(
+                "fixtureId"
+            )
         )
 
-        if fixture_id:
-            result[fixture_id] = fixture
+
+        if not fixture_id:
+            continue
+
+
+        if (
+            allowed is not None
+            and
+            fixture_id not in allowed
+        ):
+
+            continue
+
+
+        result[
+            fixture_id
+        ] = fixture
+
 
     return result
 
 
 # =========================================================
-# FECHAS
-# =========================================================
-
-def parse_timestamp(value):
-
-    if not value:
-        return None
-
-    try:
-
-        return datetime.fromisoformat(
-            value.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-    except Exception:
-        return None
-
-
-def age_minutes(value):
-
-    dt = parse_timestamp(value)
-
-    if not dt:
-        return None
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    seconds = (
-        now - dt
-    ).total_seconds()
-
-    return round(
-        seconds / 60,
-        1
-    )
-
-
-# =========================================================
-# BOOKMAKER VÁLIDO
+# MERCADOS DE BOOKMAKER
 # =========================================================
 
 def get_bookmaker_markets(
@@ -364,27 +620,41 @@ def get_bookmaker_markets(
 ):
 
     bookmaker_data = (
+
         fixture
-        .get("bookmakerOdds", {})
-        .get(bookmaker)
+        .get(
+            "bookmakerOdds",
+            {}
+        )
+        .get(
+            bookmaker
+        )
     )
+
 
     if not bookmaker_data:
         return None
 
+
     if (
         bookmaker_data.get(
             "bookmakerIsActive"
-        ) is False
+        )
+        is False
     ):
+
         return None
+
 
     if (
         bookmaker_data.get(
             "suspended"
-        ) is True
+        )
+        is True
     ):
+
         return None
+
 
     return bookmaker_data.get(
         "markets",
@@ -403,57 +673,88 @@ def get_selection(
 ):
 
     market = markets.get(
-        str(market_id),
+
+        str(
+            market_id
+        ),
+
         {}
     )
+
 
     if not market:
         return None
 
+
     if (
-        market.get("marketActive")
+        market.get(
+            "marketActive"
+        )
         is False
     ):
+
         return None
 
+
     outcome = (
+
         market
-        .get("outcomes", {})
         .get(
-            str(outcome_id),
+            "outcomes",
+            {}
+        )
+        .get(
+            str(
+                outcome_id
+            ),
             {}
         )
     )
+
 
     players = outcome.get(
         "players",
         {}
     )
 
-    for player in players.values():
 
-        # Permitimos null.
-        # Solo rechazamos explícitamente false.
+    for player in (
+        players.values()
+    ):
+
+
         if (
-            player.get("active")
+            player.get(
+                "active"
+            )
             is False
         ):
+
             continue
+
 
         price = player.get(
             "price"
         )
 
+
         if price is None:
             continue
 
+
         try:
-            price = float(price)
+
+            price = float(
+                price
+            )
+
         except Exception:
             continue
 
+
         if price <= 1:
             continue
+
 
         return {
 
@@ -465,22 +766,18 @@ def get_selection(
                     "changedAt"
                 ),
 
-            "bookmakerChangedAt":
-                player.get(
-                    "bookmakerChangedAt"
-                ),
-
             "mainLine":
                 player.get(
                     "mainLine"
                 )
         }
 
+
     return None
 
 
 # =========================================================
-# MERCADO COMPLETO
+# EXTRAER MERCADO
 # =========================================================
 
 def extract_market(
@@ -490,21 +787,36 @@ def extract_market(
 
     result = {}
 
+
     for (
-        name,
+        selection_name,
         outcome_id
-    ) in config["outcomes"].items():
+    ) in config[
+        "outcomes"
+    ].items():
+
 
         selection = get_selection(
+
             markets,
-            config["market_id"],
+
+            config[
+                "market_id"
+            ],
+
             outcome_id
         )
 
+
         if not selection:
+
             return None
 
-        result[name] = selection
+
+        result[
+            selection_name
+        ] = selection
+
 
     return result
 
@@ -513,350 +825,480 @@ def extract_market(
 # QUITAR MARGEN
 # =========================================================
 
-def remove_vig(market):
+def remove_vig(
+    market
+):
 
     implied = {}
+
     total = 0.0
 
-    for selection, data in market.items():
 
-        p = (
+    for (
+        selection,
+        data
+    ) in market.items():
+
+
+        probability = (
+
             1.0
             /
-            data["price"]
+            data[
+                "price"
+            ]
         )
 
-        implied[selection] = p
 
-        total += p
+        implied[
+            selection
+        ] = probability
+
+
+        total += probability
+
 
     if total <= 0:
         return None
 
+
     fair = {}
 
-    for selection, probability in implied.items():
 
-        p_fair = (
+    for (
+        selection,
+        probability
+    ) in implied.items():
+
+
+        fair_probability = (
+
             probability
             /
             total
         )
 
-        fair[selection] = {
+
+        fair[
+            selection
+        ] = {
 
             "probability":
-                p_fair,
+                fair_probability,
 
             "fair_odds":
-                1.0 / p_fair
+                (
+                    1.0
+                    /
+                    fair_probability
+                )
         }
+
 
     return fair
 
 
 # =========================================================
-# SCORE
+# CLASIFICAR CANDIDATO
 # =========================================================
 
-def calculate_score(
-    edge,
-    refs,
+def classify_candidate(
+
+    market_name,
+    selection,
+    win_price,
+    probability_pct,
+    edge_pct,
+    refs_count,
     confirmations,
-    dispersion,
-    win_price
+    dispersion_pct
 ):
 
-    # Cuotas > 6:
-    # requieren revisión manual
-    high_odds = (
-        win_price > 6
-    )
+    # Necesitamos mínimo 2 referencias
+
+    if refs_count < 2:
+
+        return "PASS"
 
 
-    if (
-        edge >= 8
-        and refs >= 3
-        and confirmations == refs
-        and dispersion <= 8
-        and not high_odds
-    ):
+    # Todas las disponibles deben confirmar
 
-        return "A+", "APTO"
+    if confirmations != refs_count:
+
+        return "PASS"
 
 
-    if (
-        edge >= 6
-        and refs >= 2
-        and confirmations == refs
-        and dispersion <= 10
-        and not high_odds
-    ):
+    # Mercado demasiado dividido
 
-        return "A", "APTO"
+    if dispersion_pct > 10:
 
+        return "PASS"
+
+
+    # Evitamos Over 3.5 como señal diaria.
+    # Seguimos pudiendo detectar Under 3.5.
 
     if (
-        edge >= 4
-        and refs >= 2
-        and confirmations >= 2
-        and dispersion <= 15
+        market_name
+        ==
+        "Over Under 3.5"
+
+        and
+
+        selection
+        ==
+        "Over 3.5"
     ):
 
-        return "B", "REVISAR"
+        return "PASS"
 
-
-    return "PASS", "PASS"
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-@app.route("/")
-def home():
-
-    return jsonify({
-
-        "status":
-            "ok",
-
-        "message":
-            "Winamax Value Scanner V3",
-
-        "rutas": {
-            "value_v3":
-                "/value-v3",
-
-            "simple":
-                "/simple",
-
-            "quota":
-                "/quota"
-        }
-    })
-
-
-# =========================================================
-# QUOTA
-# =========================================================
-
-@app.route("/quota")
-def quota():
-
-    data, error = api_request(
-        ACCOUNT_URL,
-        {
-            "apiKey":
-                API_KEY
-        }
-    )
-
-    if error:
-
-        return jsonify({
-            "error": error
-        }), 500
-
-    if isinstance(data, dict):
-
-        data.pop(
-            "api_key",
-            None
-        )
-
-        data.pop(
-            "apiKey",
-            None
-        )
-
-    return jsonify(data)
-
-
-# =========================================================
-# SIMPLE
-# =========================================================
-
-@app.route("/simple")
-def simple():
-
-    raw, error = get_bookmaker_odds(
-        TARGET_BOOKMAKER
-    )
-
-    if error:
-
-        return jsonify({
-            "error": error
-        }), 500
-
-
-    fixtures = normalize_fixtures(
-        raw
-    )
-
-    results = []
-
-
-    for fixture in fixtures:
-
-        markets = get_bookmaker_markets(
-            fixture,
-            TARGET_BOOKMAKER
-        )
-
-        if markets is None:
-            continue
-
-
-        partido = {
-
-            "fixtureId":
-                fixture.get(
-                    "fixtureId"
-                ),
-
-            "startTime":
-                fixture.get(
-                    "startTime"
-                ),
-
-            "partido": (
-                f"{fixture.get('participant1Name', 'Local')} - "
-                f"{fixture.get('participant2Name', 'Visitante')}"
-            )
-        }
-
-
-        for market_name, config in MARKETS.items():
-
-            extracted = extract_market(
-                markets,
-                config
-            )
-
-            if not extracted:
-
-                partido[
-                    market_name
-                ] = None
-
-            else:
-
-                partido[
-                    market_name
-                ] = {
-
-                    selection:
-                        data["price"]
-
-                    for (
-                        selection,
-                        data
-                    ) in extracted.items()
-                }
-
-
-        results.append(partido)
-
-
-    return jsonify({
-
-        "status":
-            "ok",
-
-        "numero_partidos":
-            len(results),
-
-        "partidos":
-            results
-    })
-
-
-# =========================================================
-# VALUE V3
-# =========================================================
-
-@app.route("/value-v3")
-def value_v3():
 
     # =====================================================
-    # WINAMAX
+    # NIVEL A
     # =====================================================
 
-    win_raw, error = get_bookmaker_odds(
-        TARGET_BOOKMAKER
+    if (
+
+        probability_pct >= 60
+
+        and
+
+        edge_pct >= 5
+
+        and
+
+        1.40 <= win_price <= 2.10
+
+        and
+
+        dispersion_pct <= 8
+    ):
+
+        return "A"
+
+
+    # =====================================================
+    # NIVEL B
+    # =====================================================
+
+    if (
+
+        probability_pct >= 57
+
+        and
+
+        edge_pct >= 3.5
+
+        and
+
+        1.45 <= win_price <= 2.30
+    ):
+
+        return "B"
+
+
+    # =====================================================
+    # NIVEL C
+    # PARA TENER MÁS POSIBILIDADES DE SEÑAL DIARIA
+    # =====================================================
+
+    if (
+
+        probability_pct >= 54
+
+        and
+
+        edge_pct >= 2.5
+
+        and
+
+        1.45 <= win_price <= 2.40
+    ):
+
+        return "C"
+
+
+    return "PASS"
+
+
+# =========================================================
+# RANKING
+# =========================================================
+
+def level_rank(
+    level
+):
+
+    return {
+
+        "A": 3,
+        "B": 2,
+        "C": 1,
+        "PASS": 0
+
+    }.get(
+        level,
+        0
     )
 
-    if error:
 
-        return jsonify({
+# =========================================================
+# MOTOR V4
+# =========================================================
+
+def build_value_v4():
+
+
+    # =====================================================
+    # 1. DESCUBRIR TODO EL FÚTBOL DE HOY
+    # =====================================================
+
+    fixtures_raw, fixtures_error = (
+        get_today_winamax_fixtures()
+    )
+
+
+    if fixtures_error:
+
+        return None, {
+
             "error":
-                "Error Winamax",
+                "Error obteniendo los partidos de hoy",
 
             "detalle":
-                error
-        }), 500
+                fixtures_error
+        }
 
 
-    win_index = index_fixtures(
-        win_raw
+    today_fixtures = (
+        normalize_fixtures(
+            fixtures_raw
+        )
     )
 
 
     # =====================================================
-    # REFERENCIAS
+    # SIN PARTIDOS
     # =====================================================
 
-    reference_indexes = {}
+    if not today_fixtures:
 
-    reference_errors = {}
+        (
+            _,
+            _,
+            local_date
+        ) = today_utc_range()
 
 
-    for bookmaker in REFERENCE_BOOKMAKERS:
+        return {
 
-        raw, error = get_bookmaker_odds(
-            bookmaker
+            "status":
+                "ok",
+
+            "version":
+                "V4 todo el futbol",
+
+            "fecha_local":
+                local_date,
+
+            "partidos_winamax_hoy":
+                0,
+
+            "torneos_detectados":
+                0,
+
+            "senal_del_dia":
+                None,
+
+            "top_candidatos":
+                [],
+
+            "mensaje":
+                "No hay partidos pre-match de futbol con cuotas Winamax para hoy."
+
+        }, None
+
+
+    # =====================================================
+    # IDs DE PARTIDOS
+    # =====================================================
+
+    fixture_ids = {
+
+        fixture.get(
+            "fixtureId"
         )
+
+        for fixture
+        in today_fixtures
+
+        if fixture.get(
+            "fixtureId"
+        )
+    }
+
+
+    # =====================================================
+    # TODOS LOS TORNEOS DEL DÍA
+    # =====================================================
+
+    tournament_ids = sorted({
+
+        fixture.get(
+            "tournamentId"
+        )
+
+        for fixture
+        in today_fixtures
+
+        if fixture.get(
+            "tournamentId"
+        )
+        is not None
+    })
+
+
+    # =====================================================
+    # METADATOS
+    # =====================================================
+
+    fixture_meta = {
+
+        fixture.get(
+            "fixtureId"
+        ):
+            fixture
+
+        for fixture
+        in today_fixtures
+
+        if fixture.get(
+            "fixtureId"
+        )
+    }
+
+
+    # =====================================================
+    # 2. DESCARGAR CUOTAS
+    # =====================================================
+
+    bookmaker_indexes = {}
+
+    bookmaker_errors = {}
+
+
+    bookmakers = [
+
+        TARGET_BOOKMAKER
+
+    ] + REFERENCE_BOOKMAKERS
+
+
+    for bookmaker in bookmakers:
+
+
+        raw, error = (
+            get_bookmaker_odds(
+
+                bookmaker,
+
+                tournament_ids
+            )
+        )
+
 
         if error:
 
-            reference_errors[
+            bookmaker_errors[
                 bookmaker
             ] = error
 
-        else:
-
-            reference_indexes[
-                bookmaker
-            ] = index_fixtures(
-                raw
-            )
+            continue
 
 
-    if len(reference_indexes) < 2:
+        bookmaker_indexes[
+            bookmaker
+        ] = index_fixtures(
 
-        return jsonify({
+            raw,
 
-            "status":
-                "error",
-
-            "mensaje":
-                "Menos de 2 referencias disponibles",
-
-            "errores":
-                reference_errors
-
-        }), 500
-
-
-    candidatos = []
-
-    mercados_analizados = 0
+            allowed_ids=
+                fixture_ids
+        )
 
 
     # =====================================================
-    # PARTIDOS
+    # WINAMAX OBLIGATORIO
+    # =====================================================
+
+    if (
+        TARGET_BOOKMAKER
+        not in bookmaker_indexes
+    ):
+
+        return None, {
+
+            "error":
+                "No se pudieron obtener cuotas de Winamax",
+
+            "errores":
+                bookmaker_errors
+        }
+
+
+    # =====================================================
+    # REFERENCIAS DISPONIBLES
+    # =====================================================
+
+    references_ok = [
+
+        bookmaker
+
+        for bookmaker
+        in REFERENCE_BOOKMAKERS
+
+        if bookmaker
+        in bookmaker_indexes
+    ]
+
+
+    if len(
+        references_ok
+    ) < 2:
+
+        return None, {
+
+            "error":
+                "No hay suficientes referencias disponibles",
+
+            "referencias_ok":
+                references_ok,
+
+            "errores":
+                bookmaker_errors
+        }
+
+
+    # =====================================================
+    # VARIABLES
+    # =====================================================
+
+    candidates = []
+
+    markets_analyzed = 0
+
+    fixtures_with_consensus = set()
+
+
+    win_index = (
+        bookmaker_indexes[
+            TARGET_BOOKMAKER
+        ]
+    )
+
+
+    # =====================================================
+    # 3. RECORRER TODOS LOS PARTIDOS
     # =====================================================
 
     for (
@@ -865,15 +1307,28 @@ def value_v3():
     ) in win_index.items():
 
 
-        partido_nombre = (
-            f"{win_fixture.get('participant1Name', 'Local')} - "
-            f"{win_fixture.get('participant2Name', 'Visitante')}"
+        meta = fixture_meta.get(
+
+            fixture_id,
+
+            win_fixture
         )
 
 
-        win_markets = get_bookmaker_markets(
-            win_fixture,
-            TARGET_BOOKMAKER
+        match_name = (
+
+            f"{meta.get('participant1Name', 'Local')} - "
+            f"{meta.get('participant2Name', 'Visitante')}"
+        )
+
+
+        win_markets = (
+            get_bookmaker_markets(
+
+                win_fixture,
+
+                TARGET_BOOKMAKER
+            )
         )
 
 
@@ -882,15 +1337,22 @@ def value_v3():
 
 
         # =================================================
-        # MERCADOS
+        # TODOS LOS MERCADOS
         # =================================================
 
-        for market_name, config in MARKETS.items():
+        for (
+            market_name,
+            config
+        ) in MARKETS.items():
 
 
-            win_market = extract_market(
-                win_markets,
-                config
+            win_market = (
+                extract_market(
+
+                    win_markets,
+
+                    config
+                )
             )
 
 
@@ -899,44 +1361,67 @@ def value_v3():
 
 
             ref_raw = {}
+
             ref_fair = {}
 
 
-            for (
-                bookmaker,
-                fixtures
-            ) in reference_indexes.items():
+            # =============================================
+            # REFERENCIAS
+            # =============================================
+
+            for bookmaker in (
+                references_ok
+            ):
 
 
-                fixture = fixtures.get(
-                    fixture_id
+                ref_fixture = (
+
+                    bookmaker_indexes[
+                        bookmaker
+                    ].get(
+                        fixture_id
+                    )
                 )
 
-                if not fixture:
+
+                if not ref_fixture:
                     continue
 
 
-                markets = get_bookmaker_markets(
-                    fixture,
-                    bookmaker
+                ref_markets = (
+                    get_bookmaker_markets(
+
+                        ref_fixture,
+
+                        bookmaker
+                    )
                 )
 
-                if not markets:
+
+                if not ref_markets:
                     continue
 
 
-                raw_market = extract_market(
-                    markets,
-                    config
+                raw_market = (
+                    extract_market(
+
+                        ref_markets,
+
+                        config
+                    )
                 )
+
 
                 if not raw_market:
                     continue
 
 
-                fair_market = remove_vig(
-                    raw_market
+                fair_market = (
+                    remove_vig(
+                        raw_market
+                    )
                 )
+
 
                 if not fair_market:
                     continue
@@ -946,16 +1431,24 @@ def value_v3():
                     bookmaker
                 ] = raw_market
 
+
                 ref_fair[
                     bookmaker
                 ] = fair_market
 
 
-            if len(ref_fair) < 2:
+            if len(
+                ref_fair
+            ) < 2:
+
                 continue
 
 
-            mercados_analizados += 1
+            markets_analyzed += 1
+
+            fixtures_with_consensus.add(
+                fixture_id
+            )
 
 
             # =================================================
@@ -969,7 +1462,9 @@ def value_v3():
 
 
                 win_price = (
-                    win_selection["price"]
+                    win_selection[
+                        "price"
+                    ]
                 )
 
 
@@ -980,17 +1475,26 @@ def value_v3():
                 confirmations = 0
 
 
+                # =============================================
+                # CADA CASA SHARP
+                # =============================================
+
                 for (
                     bookmaker,
                     fair_market
                 ) in ref_fair.items():
 
 
-                    if selection not in fair_market:
+                    if (
+                        selection
+                        not in fair_market
+                    ):
+
                         continue
 
 
                     probability = (
+
                         fair_market[
                             selection
                         ][
@@ -1000,6 +1504,7 @@ def value_v3():
 
 
                     fair_odds = (
+
                         fair_market[
                             selection
                         ][
@@ -1008,11 +1513,14 @@ def value_v3():
                     )
 
 
-                    raw_selection = (
+                    raw_price = (
+
                         ref_raw[
                             bookmaker
                         ][
                             selection
+                        ][
+                            "price"
                         ]
                     )
 
@@ -1022,7 +1530,11 @@ def value_v3():
                     )
 
 
-                    if win_price > fair_odds:
+                    if (
+                        win_price
+                        >
+                        fair_odds
+                    ):
 
                         confirmations += 1
 
@@ -1033,9 +1545,7 @@ def value_v3():
 
                         "cuota":
                             round(
-                                raw_selection[
-                                    "price"
-                                ],
+                                raw_price,
                                 3
                             ),
 
@@ -1063,9 +1573,9 @@ def value_v3():
                     continue
 
 
-                # -----------------------------------------
+                # =============================================
                 # CONSENSO
-                # -----------------------------------------
+                # =============================================
 
                 consensus_probability = (
                     statistics.median(
@@ -1075,22 +1585,27 @@ def value_v3():
 
 
                 consensus_odds = (
+
                     1.0
                     /
                     consensus_probability
                 )
 
 
-                # -----------------------------------------
+                # =============================================
                 # DISPERSIÓN
-                # -----------------------------------------
+                # =============================================
 
                 dispersion = (
 
                     (
-                        max(probabilities)
+                        max(
+                            probabilities
+                        )
                         -
-                        min(probabilities)
+                        min(
+                            probabilities
+                        )
                     )
 
                     /
@@ -1100,9 +1615,9 @@ def value_v3():
                 ) * 100
 
 
-                # -----------------------------------------
+                # =============================================
                 # EDGE
-                # -----------------------------------------
+                # =============================================
 
                 edge = (
 
@@ -1117,122 +1632,71 @@ def value_v3():
                 ) * 100
 
 
-                if edge < 3:
+                probability_pct = (
+
+                    consensus_probability
+                    *
+                    100
+                )
+
+
+                # =============================================
+                # NIVEL
+                # =============================================
+
+                level = classify_candidate(
+
+                    market_name=
+                        market_name,
+
+                    selection=
+                        selection,
+
+                    win_price=
+                        win_price,
+
+                    probability_pct=
+                        probability_pct,
+
+                    edge_pct=
+                        edge,
+
+                    refs_count=
+                        refs_count,
+
+                    confirmations=
+                        confirmations,
+
+                    dispersion_pct=
+                        dispersion
+                )
+
+
+                if level == "PASS":
                     continue
 
 
-                # -----------------------------------------
-                # SCORE
-                # -----------------------------------------
+                # =============================================
+                # GUARDAR CANDIDATO
+                # =============================================
 
-                score, decision = (
-                    calculate_score(
-
-                        edge,
-
-                        refs_count,
-
-                        confirmations,
-
-                        dispersion,
-
-                        win_price
-                    )
-                )
-
-
-                # -----------------------------------------
-                # INFO DE CAMBIOS
-                # NO SE USA PARA DESCARTAR
-                # -----------------------------------------
-
-                win_change_age = age_minutes(
-                    win_selection.get(
-                        "changedAt"
-                    )
-                )
-
-
-                reference_ages = {
-
-                    bookmaker:
-                        age_minutes(
-                            ref_raw[
-                                bookmaker
-                            ][
-                                selection
-                            ].get(
-                                "changedAt"
-                            )
-                        )
-
-                    for bookmaker
-                    in references.keys()
-                }
-
-
-                # -----------------------------------------
-                # ALERTAS
-                # -----------------------------------------
-
-                alertas = []
-
-
-                if dispersion > 10:
-
-                    alertas.append(
-                        "Dispersion alta"
-                    )
-
-
-                if win_price > 6:
-
-                    alertas.append(
-                        "Cuota superior a 6"
-                    )
-
-
-                if confirmations < refs_count:
-
-                    alertas.append(
-                        "No todas las referencias confirman"
-                    )
-
-
-                # Detectamos movimiento MUY reciente
-                # de las referencias.
-                refs_recent = sum(
-
-                    1
-                    for age
-                    in reference_ages.values()
-
-                    if (
-                        age is not None
-                        and
-                        0 <= age <= 15
-                    )
-                )
-
-
-                if (
-                    win_change_age is not None
-                    and win_change_age > 30
-                    and refs_recent >= 2
-                ):
-
-                    alertas.append(
-                        "Referencias se movieron recientemente: confirmar que Winamax mantiene la cuota"
-                    )
-
-
-                candidatos.append({
+                candidates.append({
 
                     "fixtureId":
                         fixture_id,
 
                     "partido":
-                        partido_nombre,
+                        match_name,
+
+                    "hora":
+                        meta.get(
+                            "startTime"
+                        ),
+
+                    "torneo":
+                        meta.get(
+                            "tournamentName"
+                        ),
 
                     "mercado":
                         market_name,
@@ -1246,22 +1710,27 @@ def value_v3():
                             3
                         ),
 
-                    "probabilidad_consenso_pct":
-                        round(
-                            consensus_probability
-                            * 100,
-                            2
-                        ),
-
                     "cuota_justa_consenso":
                         round(
                             consensus_odds,
                             3
                         ),
 
+                    "probabilidad_consenso_pct":
+                        round(
+                            probability_pct,
+                            2
+                        ),
+
                     "edge_pct":
                         round(
                             edge,
+                            2
+                        ),
+
+                    "dispersion_pct":
+                        round(
+                            dispersion,
                             2
                         ),
 
@@ -1271,23 +1740,11 @@ def value_v3():
                     "referencias_confirmando":
                         confirmations,
 
-                    "dispersion_pct":
-                        round(
-                            dispersion,
-                            2
-                        ),
-
-                    "value_score":
-                        score,
+                    "nivel":
+                        level,
 
                     "decision":
-                        decision,
-
-                    "ultima_modificacion_winamax_minutos":
-                        win_change_age,
-
-                    "alertas":
-                        alertas,
+                        "APTO",
 
                     "referencias":
                         references
@@ -1295,28 +1752,27 @@ def value_v3():
 
 
     # =====================================================
-    # ORDENAR
+    # 4. ORDENAR
+    # NIVEL -> PROBABILIDAD -> EDGE
     # =====================================================
 
-    score_rank = {
-        "A+": 3,
-        "A": 2,
-        "B": 1,
-        "PASS": 0
-    }
+    candidates.sort(
 
+        key=lambda item: (
 
-    candidatos.sort(
-
-        key=lambda x: (
-
-            score_rank.get(
-                x["value_score"],
-                0
+            level_rank(
+                item[
+                    "nivel"
+                ]
             ),
 
-            x["edge_pct"]
+            item[
+                "probabilidad_consenso_pct"
+            ],
 
+            item[
+                "edge_pct"
+            ]
         ),
 
         reverse=True
@@ -1324,160 +1780,246 @@ def value_v3():
 
 
     # =====================================================
-    # APTO TODOS
+    # 5. EVITAR VARIAS SEÑALES DEL MISMO PARTIDO
     # =====================================================
 
-    aptos_todos = [
+    top_candidates = []
 
-        item
-        for item in candidatos
-
-        if item[
-            "decision"
-        ] == "APTO"
-    ]
+    used_matches = set()
 
 
-    # =====================================================
-    # SOLO EL MEJOR APTO POR PARTIDO
-    # =====================================================
-
-    mejores_por_partido = {}
+    for item in candidates:
 
 
-    for item in aptos_todos:
-
-        partido = item[
-            "partido"
+        fixture_id = item[
+            "fixtureId"
         ]
 
-        actual = mejores_por_partido.get(
-            partido
-        )
 
-        if actual is None:
-
-            mejores_por_partido[
-                partido
-            ] = item
+        if fixture_id in used_matches:
 
             continue
 
 
-        actual_rank = (
-            score_rank.get(
-                actual["value_score"],
-                0
-            )
-        )
-
-        nuevo_rank = (
-            score_rank.get(
-                item["value_score"],
-                0
-            )
+        top_candidates.append(
+            item
         )
 
 
-        if (
-            nuevo_rank > actual_rank
-            or
-            (
-                nuevo_rank == actual_rank
-                and
-                item["edge_pct"]
-                >
-                actual["edge_pct"]
-            )
-        ):
-
-            mejores_por_partido[
-                partido
-            ] = item
+        used_matches.add(
+            fixture_id
+        )
 
 
-    aptos_finales = list(
-        mejores_por_partido.values()
+        if len(
+            top_candidates
+        ) >= 5:
+
+            break
+
+
+    # =====================================================
+    # SEÑAL PRINCIPAL DEL DÍA
+    # =====================================================
+
+    signal = (
+
+        top_candidates[
+            0
+        ]
+
+        if top_candidates
+
+        else None
     )
 
 
-    aptos_finales.sort(
-        key=lambda x: (
-            score_rank.get(
-                x["value_score"],
-                0
-            ),
-            x["edge_pct"]
-        ),
-        reverse=True
-    )
-
-
-    revisar = [
-
-        item
-        for item in candidatos
-
-        if item[
-            "decision"
-        ] == "REVISAR"
-    ]
+    (
+        _,
+        _,
+        local_date
+    ) = today_utc_range()
 
 
     # =====================================================
     # RESULTADO
     # =====================================================
 
-    return jsonify({
+    result = {
 
         "status":
             "ok",
 
         "version":
-            "V3",
+            "V4 todo el futbol",
+
+        "fecha_local":
+            local_date,
 
         "metodo":
             "Winamax vs consenso Pinnacle/SingBet/SBOBET sin margen",
 
-        "referencias_funcionando":
-            list(
-                reference_indexes.keys()
+        "partidos_winamax_hoy":
+            len(
+                today_fixtures
             ),
 
-        "errores_referencias":
-            reference_errors,
+        "torneos_detectados":
+            len(
+                tournament_ids
+            ),
 
-        "intervalo_api_segundos":
-            ODDS_MIN_INTERVAL,
+        "partidos_con_consenso":
+            len(
+                fixtures_with_consensus
+            ),
 
         "mercados_analizados":
-            mercados_analizados,
+            markets_analyzed,
 
-        "numero_aptos_finales":
-            len(
-                aptos_finales
+        "referencias_funcionando":
+            references_ok,
+
+        "errores_bookmakers":
+            bookmaker_errors,
+
+        "peticiones_api_estimadas":
+            (
+                1
+                +
+                1
+                +
+                len(
+                    REFERENCE_BOOKMAKERS
+                )
             ),
 
-        "aptos_finales":
-            aptos_finales,
-
-        "numero_aptos_sin_deduplicar":
+        "numero_candidatos":
             len(
-                aptos_todos
+                candidates
             ),
 
-        "numero_revisar":
-            len(
-                revisar
-            ),
+        "senal_del_dia":
+            signal,
 
-        "revisar":
-            revisar
+        "top_candidatos":
+            top_candidates
+    }
+
+
+    return (
+        result,
+        None
+    )
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.route("/")
+def home():
+
+    return jsonify({
+
+        "status":
+            "ok",
+
+        "message":
+            "Winamax Value Scanner V4 - todo el futbol del dia",
+
+        "rutas": {
+
+            "value_v4":
+                "/value-v4",
+
+            "quota":
+                "/quota"
+        }
     })
 
 
 # =========================================================
-# ARRANCAR
+# QUOTA
+# =========================================================
+
+@app.route("/quota")
+def quota():
+
+    if not API_KEY:
+
+        return jsonify({
+            "error":
+                "ODDSPAPI_KEY no configurada"
+        }), 500
+
+
+    data, error = api_request(
+
+        ACCOUNT_URL,
+
+        {
+            "apiKey":
+                API_KEY
+        }
+    )
+
+
+    if error:
+
+        return jsonify({
+            "error":
+                error
+        }), 500
+
+
+    if isinstance(
+        data,
+        dict
+    ):
+
+        data.pop(
+            "api_key",
+            None
+        )
+
+        data.pop(
+            "apiKey",
+            None
+        )
+
+
+    return jsonify(
+        data
+    )
+
+
+# =========================================================
+# VALUE V4
+# =========================================================
+
+@app.route("/value-v4")
+def value_v4():
+
+    result, error = (
+        build_value_v4()
+    )
+
+
+    if error:
+
+        return jsonify(
+            error
+        ), 500
+
+
+    return jsonify(
+        result
+    )
+
+
+# =========================================================
+# START
 # =========================================================
 
 if __name__ == "__main__":
@@ -1490,6 +2032,8 @@ if __name__ == "__main__":
     )
 
     app.run(
+
         host="0.0.0.0",
+
         port=port
     )
